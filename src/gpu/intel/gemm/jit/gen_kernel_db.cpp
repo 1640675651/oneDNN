@@ -15,6 +15,7 @@
 *******************************************************************************/
 
 #include "gpu/intel/gemm/jit/gen_kernel_db.hpp"
+#include "gpu/intel/logging.hpp"
 
 namespace gemmstone {
 #define _CATALOG_ gemm_catalog
@@ -38,6 +39,17 @@ gemmstone::kcatalog::Catalog catalog() {
 
 gemmstone::kcatalog::Catalog lut_catalog() {
     return gemmstone::gemm_lut_catalog;
+}
+
+std::string catalog_ref(const gemmstone::kcatalog::Entry *entry) {
+    static const char *const names[] = {"kernel.db", "lut.db"};
+    int t = 0;
+    for (const auto &c : {catalog(), lut_catalog()}) {
+        if (entry >= c.entries && entry < c.entries + c.entryCount)
+            return std::string(names[t]) + ":" + lpad(entry - c.entries, 4);
+        t++;
+    }
+    return "?";
 }
 
 } // namespace jit
