@@ -14,10 +14,13 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include <algorithm>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 #include "common/c_types_map.hpp"
+#include "common/type_helpers.hpp"
 #include "common/utils.hpp"
 
 #include "gpu/intel/compute/kernel.hpp"
@@ -62,6 +65,36 @@ static uint32_t nan_safe_mask(data_type_t dt) {
     }
 }
 
+// ONEDNN_FILL_RANDOM_ZERO_LSB=x|auto: also zero the x*bits/16 low bits of each
+// element (x of 16 for f16, x/2 of 8 for s8, x/4 of 4 for u4). auto = the most
+// bits that neither trigger memory compression nor change kernel ranking (B580):
+// 14 of 16, 6 of 8, 3 of 4, 16 of 32.
+static int zero_lsb() {
+    char s[12] = {};
+    if (getenv("ONEDNN_FILL_RANDOM_ZERO_LSB", s, sizeof(s)) <= 0) return 0;
+    return std::string(s) == "auto" ? -1 : atoi(s);
+}
+
+static uint32_t fill_mask(data_type_t dt) {
+    static const int x = zero_lsb();
+    uint32_t m = nan_safe_mask(dt);
+    const int w = types::data_type_bits(dt);
+    if (x == 0 || w > 32 || 32 % w) return m;
+    const int z = x > 0 ? std::min(x * w / 16, w)
+            : w == 16   ? 14
+            : w == 8    ? 6
+            : w == 4    ? 3
+            : w == 32   ? 16
+                        : 0;
+    if (z <= 0) return m;
+    const uint32_t ones = w == 32 ? ~0u : (1u << w) - 1;
+    const uint32_t lane = ones & ~(z == 32 ? ~0u : (1u << z) - 1);
+    uint32_t keep = 0;
+    for (int i = 0; i < 32; i += w)
+        keep |= lane << i;
+    return m & keep;
+}
+
 status_t fill_random(impl::stream_t *stream, size_t size,
         impl::memory_t *memory, int buffer_index, uint32_t seed) {
     if (size == 0) return status::success;
@@ -79,7 +112,7 @@ status_t fill_random(impl::stream_t *stream, size_t size,
     arg_list.set(0, *memory->memory_storage(buffer_index));
     arg_list.set(1, seed);
     arg_list.set(2, static_cast<uint64_t>(size));
-    arg_list.set(3, nan_safe_mask(memory->md()->data_type));
+    arg_list.set(3, fill_mask(memory->md()->data_type));
 
     CHECK(kernel.parallel_for(*stream, nd_range, arg_list,
             intel_stream->ctx().get_deps(), intel_stream->ctx().get_deps()));
