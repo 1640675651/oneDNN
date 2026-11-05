@@ -23,6 +23,9 @@ namespace gemmstone {
 #define _CATALOG_ gemm_lut_catalog
 #include "selector/db/lut.db"
 #undef _CATALOG_
+#define _CATALOG_ gemm_gbr_catalog
+#include "selector/db/gbr.db"
+#undef _CATALOG_
 } // namespace gemmstone
 
 namespace dnnl {
@@ -40,10 +43,14 @@ gemmstone::kcatalog::Catalog lut_catalog() {
     return gemmstone::gemm_lut_catalog;
 }
 
+gemmstone::kcatalog::Catalog gbr_catalog() {
+    return gemmstone::gemm_gbr_catalog;
+}
+
 std::string catalog_ref(const gemmstone::kcatalog::Entry *entry) {
-    static const char *const names[] = {"kernel.db", "lut.db"};
+    static const char *const names[] = {"kernel.db", "lut.db", "gbr.db"};
     int t = 0;
-    for (const auto &c : {catalog(), lut_catalog()}) {
+    for (const auto &c : {catalog(), lut_catalog(), gbr_catalog()}) {
         if (entry >= c.entries && entry < c.entries + c.entryCount)
             return std::string(names[t]) + ":"
                     + std::to_string(entry - c.entries);

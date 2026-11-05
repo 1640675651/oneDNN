@@ -30,6 +30,7 @@ namespace jit {
 
 gemmstone::kcatalog::Catalog catalog();
 gemmstone::kcatalog::Catalog lut_catalog();
+gemmstone::kcatalog::Catalog gbr_catalog();
 // A row's log id: "TIER:ROW" (ROW = its index in the tier).
 std::string catalog_ref(const gemmstone::kcatalog::Entry *entry);
 

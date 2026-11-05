@@ -68,6 +68,9 @@ double evaluate(const kcatalog::Entry &e, const DerivedEvaluateParams &p, Evalua
 // Model-free dispatch: k0 and wgK from fixed rules.
 EvaluateAuxOutput evaluateFixed(const kcatalog::Entry &e, const DerivedEvaluateParams &p);
 
+// Scores G rows together (selector/gbr.hpp), lower = better; NaN = dropped.
+void evaluateG(const kcatalog::Entry *const *entries, int n, const EvaluateParams &p, double *scores);
+
 void modifyStrategy(GEMMStrategy &strategy, const EvaluateAuxOutput &aux);
 
 GEMMSTONE_NAMESPACE_END

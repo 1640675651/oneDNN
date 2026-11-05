@@ -20,10 +20,13 @@
 #include "gemmstone/problem.hpp"
 #include "internal/utils.hpp"
 #include "ngen_core.hpp"
+#include "selector/gbr.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
+#include <vector>
 
 GEMMSTONE_NAMESPACE_START
 
@@ -581,6 +584,29 @@ EvaluateAuxOutput evaluateFixed(const kcatalog::Entry &e, const DerivedEvaluateP
 
     evaluateECore(e, dp, aux);
     return aux;
+}
+
+void evaluateG(const kcatalog::Entry *const *entries, int n, const EvaluateParams &p, double *scores)
+{
+    std::vector<gbr::Row> rows(n);
+    auto esize = [](const kcatalog::string &precision) {
+        return extPrecision(precision, false).bits() / 8.;
+    };
+    auto scorerOf = [](const kcatalog::Entry &e) {
+        bool scale2D = std::strchr(e.restrictions.tags, kcatalog::ReqScale2D) != nullptr;
+        return gbr::scorerOf(e.selector.precisions[0][0], scale2D);
+    };
+    int scorer = scorerOf(*entries[0]);
+    gemm_assert(scorer >= 0, "gbr: G row without a scorer");
+    for (int i = 0; i < n; i++) {
+        auto &e = *entries[i];
+        gemm_assert(scorerOf(e) == scorer, "gbr: G rows of two scorers in one batch");
+        rows[i] = {e.strategy, e.driverInfo.unroll[LoopM], e.driverInfo.unroll[LoopN],
+                p.product.threadsPerEU(e.driverInfo.grfCount),
+                esize(e.selector.precisions[0]), esize(e.selector.precisions[1])};
+    }
+    gbr::Shape shape = {p.sizes.n, p.sizes.m, p.sizes.k, p.sizes.batch, p.euCount};
+    gbr::score(scorer, rows.data(), n, shape, scores);
 }
 
 void modifyStrategy(GEMMStrategy &strategy, const EvaluateAuxOutput &aux)

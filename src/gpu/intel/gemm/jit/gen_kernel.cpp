@@ -39,6 +39,7 @@
 #include "gpu/intel/jit/utils/type_bridge.hpp"
 #include "gpu/intel/logging.hpp"
 #include "gpu/intel/utils.hpp"
+#include "selector/gbr.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -68,7 +69,10 @@ SelectionObserver make_entry_observer(int eu_count, int freq_mhz,
             return r.empty() ? std::string("(unresolved)") : r;
         };
         gpu_debug() << "[" << catalog_ref(entry) << "] consider score:" << score
-                    << ms_hint(score, eu_count, freq_mhz) << " " << row();
+                    << (entry->model.id == 'G'
+                                       ? ""
+                                       : ms_hint(score, eu_count, freq_mhz))
+                    << " " << row();
     };
 }
 
@@ -130,6 +134,25 @@ std::string kernel_str(const GEMMProblem &problem, int unroll_m, int unroll_n,
     if (!astr.empty()) astr += ' ';
     return problem.toString() + ' ' + std::to_string(unroll_m) + ' '
             + std::to_string(unroll_n) + ' ' + astr + strategy;
+}
+
+// Only what the gbr rows were fit on; the rest goes to the catalog.
+bool use_gbr(const compute::device_info_t &dev_info, const GEMMProblem &problem,
+        float alpha, float beta, dim_t m, dim_t n, dim_t k, dim_t batch) {
+    if (std::find(gbr::deviceIds, gbr::deviceIds + gbr::nDeviceIds,
+                dev_info.device_id())
+            == gbr::deviceIds + gbr::nDeviceIds)
+        return false;
+    if (alpha != 1.0f || beta != 0.0f) return false;
+    if (m <= 0 || n <= 0 || k <= 0 || batch <= 0) return false;
+    if (m % gbr::nkMult != 0 || k % gbr::nkMult != 0) return false;
+    if (problem.aScale2D() || problem.bScale2D()) {
+        auto group_k = problem.Ta_scale == Type::f8_e8m0 ? problem.aqGroupK
+                : problem.Tb_scale == Type::f8_e8m0      ? problem.bqGroupK
+                                                         : 0;
+        if (group_k != gbr::mxGroup) return false;
+    }
+    return gpu_utils::dev_getenv("GEMM_GBR", true);
 }
 
 } // anonymous namespace
@@ -333,20 +356,25 @@ status_t gen_desc_t::finalize(
 
             auto um = entry_->driverInfo.unroll[LoopM];
             auto un = entry_->driverInfo.unroll[LoopN];
-            GEMMStrategy row(hw_, stepping_);
-            row.unroll[LoopM] = um;
-            row.unroll[LoopN] = un;
-            parseStrategy(entry_->strategy, problem_, row);
-            EvaluateAuxOutput sel;
-            evaluate(*entry_, eval_params, sel);
-            auto st = row;
-            set_decisions(st, selector_decisions(row, sel));
-            // Decisions only shrink, so one correction is stable.
-            set_decisions(st,
-                    kept(resolve_launch(st, *entry_, tags, eval_params), k_,
-                            aux_params_));
-            str = kernel_str(problem_, um, un,
-                    rewriteKParallel(entry_->strategy, row, st));
+            if (entry_->model.id == 'G') {
+                // A fixed kernel: literal, as an override.
+                str = kernel_str(problem_, um, un, entry_->strategy);
+            } else {
+                GEMMStrategy row(hw_, stepping_);
+                row.unroll[LoopM] = um;
+                row.unroll[LoopN] = un;
+                parseStrategy(entry_->strategy, problem_, row);
+                EvaluateAuxOutput sel;
+                evaluate(*entry_, eval_params, sel);
+                auto st = row;
+                set_decisions(st, selector_decisions(row, sel));
+                // Decisions only shrink, so one correction is stable.
+                set_decisions(st,
+                        kept(resolve_launch(st, *entry_, tags, eval_params), k_,
+                                aux_params_));
+                str = kernel_str(problem_, um, un,
+                        rewriteKParallel(entry_->strategy, row, st));
+            }
         } else {
             entry_ = nullptr;
         }
@@ -732,6 +760,7 @@ gen_nocopy_desc_t::select_kernel(const compute::device_info_t &dev_info,
     // Entries from both catalogs are concatenated so kernel creation
     // failures fall back to the next tier.
     //   GEMM_LUT: try the exact-size LUT catalog first (default on).
+    //   GEMM_GBR: try the ranked fixed kernels next (default on).
     int npat = static_cast<int>(match_params.size());
     std::vector<const kcatalog::Entry *> entries;
     auto append = [&](const std::vector<const kcatalog::Entry *> &v) {
@@ -748,6 +777,10 @@ gen_nocopy_desc_t::select_kernel(const compute::device_info_t &dev_info,
         append(select(lut_catalog(), 1, &lut_match, eval_params_, aux_params_,
                 &observer));
     }
+
+    if (use_gbr(dev_info, problem, alpha, beta, m, n, k, batch))
+        append(select(gbr_catalog(), npat, match_params.data(), eval_params_,
+                aux_params_, &observer));
 
     append(select(catalog(), npat, match_params.data(), eval_params_,
             aux_params_, &observer));
