@@ -2252,6 +2252,7 @@ RegisterLayout RegisterLayout::trySlice(vector<RegisterRange> *subaddrs, vector<
     if (indices) indices->clear();
 
     bool sharedOK = true;
+    vector<int> origIndex;
 
     for (int b = 0; b < blocks(); b++) {
         auto &block = list[b];
@@ -2275,10 +2276,34 @@ RegisterLayout RegisterLayout::trySlice(vector<RegisterRange> *subaddrs, vector<
                 return RegisterLayout();
 
             sublayout.list.push_back(subblock);
+            origIndex.push_back(b);
             if (subaddrs) subaddrs->push_back((*addrs)[b]);
             if (indices) indices->push_back(b);
         } else if (block.offsetAddr == 0)
             sharedOK = false;
+    }
+
+    // Trailing sub-blocks of a 2D block array (simdSize == 0) are filled by the
+    //  first block's load, which writes them back-to-back (no padding). If
+    //  slicing shrank the blocks, their register offsets must be rebuilt from
+    //  the new sizes.
+    // Only do this if the original layout followed the same back-to-back rule.
+    if (isBlock2D(astrategy.accessType)) {
+        auto packedAfter = [](const RegisterBlock &prev) {
+            return prev.offsetBytes + prev.bytes;
+        };
+        for (size_t i = 1; i < sublayout.list.size(); i++) {
+            int ob = origIndex[i];
+            if (ob == 0 || origIndex[i - 1] != ob - 1) continue;
+            auto &oblock = list[ob];
+            auto &oprev = list[ob - 1];
+            auto &nblock = sublayout.list[i];
+            auto &nprev = sublayout.list[i - 1];
+            if (oblock.simdSize != 0 || nblock.simdSize != 0) continue;
+            if (oblock.count <= 1 || nblock.count <= 1) continue;
+            if (oblock.offsetBytes != packedAfter(oprev)) continue;
+            nblock.offsetBytes = packedAfter(nprev);
+        }
     }
 
     return sublayout;
