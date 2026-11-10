@@ -1487,6 +1487,21 @@ int attr_args_t::prepare_post_ops_mds(const attr_t &attr, int ndims,
                     rhs_tensor_dims[d] = (!(mask & (1 << d))) ? 1 : dims[d];
             }
 
+            auto check_strides
+                    = [&](const dims_t &strides, const char *arg_str) {
+                const bool strides_ok = strides.empty()
+                        || static_cast<int>(strides.size()) == ndims;
+                if (!strides_ok) {
+                    BENCHDNN_PRINT(0,
+                            "Error: binary post-op #%d %s strides \'%s\' have "
+                            "%d dimensions, expected %d.\n",
+                            idx, arg_str, dims2str(strides).c_str(),
+                            static_cast<int>(strides.size()), ndims);
+                    SAFE_V(FAIL);
+                }
+            };
+
+            check_strides(po_rhs_tensor_entry.strides, "src1");
             auto rhs_tensor_desc = dnn_mem_t::init_md(ndims, rhs_tensor_dims,
                     po_rhs_tensor_entry.dt, po_rhs_tensor_entry.tag,
                     po_rhs_tensor_entry.strides);
@@ -1524,6 +1539,7 @@ int attr_args_t::prepare_post_ops_mds(const attr_t &attr, int ndims,
                 for (auto d = 0; d < ndims; ++d)
                     src2_tensor_dims[d]
                             = (!(src2_mask & (1 << d))) ? 1 : dims[d];
+                check_strides(e.binary.strides2, "src2");
                 auto rhs_src2_tensor_desc = dnn_mem_t::init_md(ndims,
                         src2_tensor_dims, e.binary.src2_dt, e.binary.src2_tag,
                         e.binary.strides2);
