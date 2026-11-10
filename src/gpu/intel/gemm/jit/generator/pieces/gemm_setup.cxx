@@ -1848,12 +1848,11 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
         check(state.Br_regs);
         if (std::getenv("CASE5_DEBUG_RA")) {
             auto dump = [&](const char *n, const GRFMultirange &mr) {
-                for (auto &r : mr.ranges) if (r.isValid()) std::fprintf(stderr, "[case5 ra] %s r%d+%d\n", n, r.getBase(), r.getLen());
+                for (auto &r : mr.ranges)
+                    if (r.isValid()) std::fprintf(stderr, "[case5 ra] %s r%d+%d\n", n, r.getBase(), r.getLen());
             };
             for (auto &mr : state.A_regs) dump("A", mr);
             for (auto &mr : state.B_regs) dump("B", mr);
-            dump("Ar", state.Ar_regs); dump("Br", state.Br_regs);
-            for (auto &mr : state.C_regs) dump("C", mr);
             std::fprintf(stderr, "[case5 ra] odd=%d pad_at=%d\n", int(odd), problem.case5RegPadAt);
         }
         case5OperandOddGrf() = odd;
@@ -2840,6 +2839,16 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
                 state.inputs.blake3KeyWords[i] =
                         interface.getArgumentIfExists("blake3_k" + std::to_string(i));
             }
+            if (problem.case5FuseJackpot) {
+                state.inputs.blake3CmpDump = interface.getArgumentIfExists("blake3_cmp_dump");
+                state.inputs.foundFlag = interface.getArgumentIfExists("found_flag");
+                state.inputs.trBase = interface.getArgumentIfExists("tr_base");
+                state.inputs.tcBase = interface.getArgumentIfExists("tc_base");
+                for (int i = 0; i < 8; i++) {
+                    state.inputs.blake3BoundWords[i] =
+                            interface.getArgumentIfExists("blake3_b" + std::to_string(i));
+                }
+            }
         }
     }
 
@@ -3138,9 +3147,25 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
         if (problem.case5TileXorBlake3) {
             if (state.inputs.blake3Out.isValid())
                 state.ra.claim(state.inputs.blake3Out);
+            if (state.inputs.blake3CmpDump.isValid())
+                state.ra.claim(state.inputs.blake3CmpDump);
             for (int i = 0; i < 8; i++) {
                 if (state.inputs.blake3KeyWords[i].isValid())
                     state.ra.claim(state.inputs.blake3KeyWords[i]);
+            }
+            if (problem.case5FuseJackpot) {
+                for (int i = 0; i < 8; i++) {
+                    if (state.inputs.blake3BoundWords[i].isValid())
+                        state.ra.claim(state.inputs.blake3BoundWords[i]);
+                }
+                if (state.inputs.blake3BoundBuf.isValid())
+                    state.ra.claim(state.inputs.blake3BoundBuf);
+                if (state.inputs.foundFlag.isValid())
+                    state.ra.claim(state.inputs.foundFlag);
+                if (state.inputs.trBase.isValid())
+                    state.ra.claim(state.inputs.trBase);
+                if (state.inputs.tcBase.isValid())
+                    state.ra.claim(state.inputs.tcBase);
             }
         }
     }

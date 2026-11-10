@@ -254,6 +254,15 @@ protected:
                                        GEMMState &state);
     void gemmCase5ReleaseAccForBlake3(const GEMMStrategy &strategy, GEMMState &state);
     void case5TileXorLoadAccFromSlm(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
+    void gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
+    void gemmCase5TileXorCoopStageArgs(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
+    void case5LoadGlobalDwords(const GEMMStrategy &strategy, GEMMState &state, const ngen::Subregister &base,
+                               const ngen::GRF &dst, int count);
+    void case5StoreGlobalDword(const GEMMStrategy &strategy, GEMMState &state, const ngen::Subregister &base,
+                               const ngen::Subregister &val);
+    void case5StoreGlobalDwordAtOffset(const GEMMStrategy &strategy, GEMMState &state,
+                                       const ngen::Subregister &base, int dword_offset,
+                                       const ngen::Subregister &val);
     void case5ZeroFoldGrfs(const GEMMStrategy &strategy, GEMMState &state, int nFolds);
     void case5InitTileXorSlmMatrix(const GEMMProblem &problem, const GEMMStrategy &strategy,
                                    GEMMState &state);

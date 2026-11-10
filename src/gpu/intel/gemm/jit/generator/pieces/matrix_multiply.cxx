@@ -619,13 +619,6 @@ void Generator<hw>::outerProductSystolic(int h, int ha_period, int hb_period, in
 
         bool finishChain = !strategy.extendedAtomicFMA || c5Boundary || (x + osys >= nx) || (repackC && x >= (Cr_unrollX - 2*xinc));
         issueDPAS(finishChain);
-        // Debug (CASE5_DBG_PAD=n): n independent ALU instructions after every finished chain, to
-        // measure what an ALU issue slot costs next to the dpas stream (null destination, r2 source).
-        if (finishChain) {
-            static const int dbgPad = [] { const char *v = std::getenv("CASE5_DBG_PAD"); return v ? std::atoi(v) : 0; }();
-            for (int i = 0; i < dbgPad; i++)
-                add(16, null.ud(), GRF(2).ud(), uint32_t(i + 1));
-        }
         // Case5 interleaved tile XOR: fold work at dpas chain boundaries (no {Atomic} pending here).
         if (c5Interleaved && finishChain)
             gemmCase5TileXorChainHook(problem, strategy, state, h, opCount, x, nx, osys, globalCM, false, c5XafStep);
