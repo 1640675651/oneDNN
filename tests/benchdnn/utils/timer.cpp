@@ -52,6 +52,7 @@ void timer_t::reset() {
     for (int i = 0; i < n_modes; ++i)
         ms_[i] = 0;
     ms_start_ = 0;
+    freq_ = {};
     samples_.clear();
 
     start();
@@ -205,28 +206,6 @@ void timer_t::filter_collection() {
 
     BENCHDNN_PRINT(4, "[TIMER]: MinSamples: %zu; Outliers: %zu; %s\n",
             min_n_samples, deltas_size, msg.c_str());
-}
-
-void timer_t::set_frequency(const std::vector<double> &freq_hz) {
-    if (samples_.empty() || freq_hz.size() != samples_.size()) return;
-
-    for (size_t i = 0; i < samples_.size(); i++) {
-        if (freq_hz[i] <= 0) return;
-        samples_[i].ticks = (uint64_t)(samples_[i].ms * freq_hz[i] / 1e3);
-    }
-
-    // Keep min and max ticks paired with min and max times, the same way
-    // `filter_collection()` does.
-    size_t i_min = 0, i_max = 0;
-    ticks_[mode_t::sum] = 0;
-    for (size_t i = 0; i < samples_.size(); i++) {
-        if (samples_[i].ms < samples_[i_min].ms) i_min = i;
-        if (samples_[i].ms > samples_[i_max].ms) i_max = i;
-        ticks_[mode_t::sum] += samples_[i].ticks;
-    }
-    ticks_[mode_t::min] = samples_[i_min].ticks;
-    ticks_[mode_t::max] = samples_[i_max].ticks;
-    ticks_[mode_t::avg] = ticks_[mode_t::sum];
 }
 
 timer_t &timer_t::operator=(const timer_t &rhs) {
