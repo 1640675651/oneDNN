@@ -436,21 +436,81 @@ void Generator<hw>::outerProductSystolic(int h, int ha_period, int hb_period, in
     if (opCount > ksys || snake)
         ny1 = rcountMax * (strategy.dpasw ? 2 : 1);
 
-    // Case5 interleaved tile XOR under xaf (whole step one atomic chain). Default (hybrid): the
-    // per-pass chains (and the pass-0 fold hooks) only in the first and last step of a milestone,
-    // the whole-step chain elsewhere. CASE5_XOR_XAF=1 keeps xaf everywhere and folds the lower rows
-    // right before the next step's chain instead.
+    // Case5 interleaved tile XOR under xaf (whole step one atomic chain). Hybrid (CASE5_XOR_XAF=hybrid):
+    // the per-pass chains (and the pass-0 fold hooks) only in the first and last step of a milestone,
+    // the whole-step chain elsewhere. CASE5_XOR_XAF=1 keeps xaf everywhere, folds the upper rows at the
+    // end of the last step and the lower rows right before the next step's chain. Default: xaf everywhere
+    // on XeHPG with a tiled packed A (A770, 2000 MHz bursts: 233.4 vs 231.0 TOPS, sustained 231.2 vs
+    // 228.6; every split chain there costs a wait for a chain to complete, and the skeleton of the
+    // hybrid mode alone is 1.8% of pure GEMM against 0.2%), hybrid otherwise (with the untiled panel
+    // hybrid was ahead: note.md 2026-10-18).
     const bool c5Interleaved = problem.case5TileXor && problem.case5TileXorInterleaved;
     bool c5Boundary = false;
     if (c5Interleaved && strategy.extendedAtomicFMA) {
         const char *xm = std::getenv("CASE5_XOR_XAF");
         const int uk = strategy.unroll[LoopK];
-        if (!(xm && xm[0] == '1'))
+        const bool tiledPackedA = problem.A.layout == MatrixLayout::Pc && problem.A.tileR > 0 && problem.A.tileC > 0;
+        const bool everywhere = xm ? (xm[0] == '1') : (hw == HW::XeHPG && tiledPackedA);
+        if (!everywhere)
             c5Boundary = ((h % uk) == 0) || (((h + opCount) % uk) == 0);
     }
     const bool c5XafStep = strategy.extendedAtomicFMA && !c5Boundary;
 
     for (int x = 0; x < nx; x += xinc) {
+        // Debug padding (CASE5_DBG_PAD*): kind 0 add null <- r2 + imm (no operand toggling), 1 bfn null <-
+        // three C GRFs, 2 xor null <- two C GRFs, 3 mov null <- one C GRF (fresh accumulator data, no
+        // register write), 5 jmpi to the next instruction, 6 cmp + never-taken jmpi, 7 cmp. The C reads
+        // start at C GRF CASE5_DBG_PAD_COFF.
+        auto dbgPadEmit = [&](int count) {
+            static const int kind = [] { const char *v = std::getenv("CASE5_DBG_PAD_KIND"); return v ? std::atoi(v) : 0; }();
+            static const int coff = [] { const char *v = std::getenv("CASE5_DBG_PAD_COFF"); return v ? std::atoi(v) : 0; }();
+            const int nC = state.C_regs.empty() ? 0 : state.C_regs[0].getLen();
+            auto Creg = [&](int k) { return state.C_regs[0][(coff + k) % nC].ud(); };
+            for (int i = 0; i < count; i++) {
+                if (kind == 0 || nC < 4)
+                    add(16, null.ud(), GRF(2).ud(), uint32_t(i + 1));
+                else if (kind == 1)
+                    bfn(16, 0x96, null.ud(), Creg(3 * i), Creg(3 * i + 1), Creg(3 * i + 2));
+                else if (kind == 2)
+                    xor_(16, null.ud(), Creg(2 * i), Creg(2 * i + 1));
+                else if (kind == 5 || kind == 6 || kind == 7) {
+                    Label lNext;
+                    if (kind != 5) cmp(1 | ne | f1[0], null.ud(), GRF(2).ud(0), GRF(2).ud(0));
+                    if (kind == 5) jmpi(1, lNext);
+                    if (kind == 6) jmpi(1 | f1[0], lNext);
+                    mark(lNext);
+                } else
+                    mov(16, null.ud(), Creg(i));
+            }
+        };
+        static const int dbgPadStep = [] { const char *v = std::getenv("CASE5_DBG_PAD_STEP"); return v ? std::atoi(v) : -1; }();
+        const bool dbgPadStepOk = dbgPadStep < 0 || dbgPadStep == (h % strategy.unroll[LoopK]) / std::max(1, opCount);
+        // CASE5_WAIT_MID / CASE5_WAIT_PRE=p1|p0 (Case 5 kernels on a col-major C): make the first dpas of
+        // a row pass wait for an earlier chain of this thread (wrdep, no instruction): before a later pass
+        // for the pass just issued (MID), before pass 0 for the previous step's last pass (p1) or first
+        // pass (p0; both experimental, no gain). See note.md 2026-11-10 (chains issued detached from one
+        // still in the pipe starve it on Xe2).
+        if (problem.case5TileXor && globalCM && !state.C_regs.empty() && state.C_regs[0].getLen() > 0) {
+            static const int waitPre = [] {
+                const char *v = std::getenv("CASE5_WAIT_PRE");
+                return !v ? 0 : (!std::strcmp(v, "p1") ? 1 : (!std::strcmp(v, "p0") ? 2 : 0));
+            }();
+            // Default: on Xe2 with a tiled packed A (no deinterleave movs between the loads and pass 0; the
+            // movs' wait on the previous chain is what kept the two passes of a step together). With the
+            // untiled panel it is a loss in Case 5 (215 vs 224 TOPS at 2850 MHz).
+            static const int waitMidEnv = [] { const char *v = std::getenv("CASE5_WAIT_MID"); return !v ? -1 : (v[0] == '1'); }();
+            const bool tiledA = problem.A.layout == MatrixLayout::Pc && problem.A.tileR > 0 && problem.A.tileC > 0;
+            const bool waitMid = (waitMidEnv >= 0) ? (waitMidEnv == 1) : (hw >= HW::Xe2 && tiledA);
+            const int lastCol = strategy.unroll[LoopN] - 1;
+            auto Cgrf = [&](int row) { return GRF(state.C_layout.find(row, lastCol, state.C_regs[0]).getBase()); };
+            if (x == 0 && waitPre == 1) wrdep(Cgrf(nx - 1));
+            if (x == 0 && waitPre == 2) wrdep(Cgrf(0));
+            if (x > 0 && waitMid) wrdep(Cgrf(x - 1));
+        }
+        if (x == 0 && dbgPadStepOk) {   // CASE5_DBG_PAD_PRE=n: n pad instructions before the step's first dpas
+            static const int dbgPadPre = [] { const char *v = std::getenv("CASE5_DBG_PAD_PRE"); return v ? std::atoi(v) : 0; }();
+            dbgPadEmit(dbgPadPre);
+        }
         if (c5Interleaved && x == 0)   // pre-chain hook: xaf lower rows, or CASE5_XOR_TOPAT=prechain upper rows
             gemmCase5TileXorChainHook(problem, strategy, state, h, opCount, x, nx, osys, globalCM, true, c5XafStep);
         Subregister A0, B0, C0;
@@ -473,9 +533,22 @@ void Generator<hw>::outerProductSystolic(int h, int ha_period, int hb_period, in
             }
 
             if (strategy.atomicFMA) {
-                if (!last && (rc == 8 || canAtomicNon8x8))
+                // Case5 CASE5_XOR_SPREAD: fold ops follow this dpas, so it cannot continue a macro.
+                const bool foldFollows = c5Interleaved && case5FoldSpreadFollows();
+                if (!last && (rc == 8 || canAtomicNon8x8) && !foldFollows)
                     mod |= Atomic;
                 if (rc != 8 && strategy.extendedAtomicFMA) hw_unsupported();
+            }
+
+            // CASE5_XOR_P1TOKEN=n (XeHPG hybrid chains): the chain of a later row pass in a split step
+            // gets SBID n instead of nGEN's automatic choice. That choice reuses a token the chain
+            // depends on: pass 1 of the first step takes the token pass 0 just took (and so waits for
+            // that chain to complete instead of queueing behind it), pass 1 of the last step takes the
+            // barrier fence's token (and the next step's barrier signal then waits for the chain). n
+            // must be a token the k loop does not use (13..15 with the XeHPG family kernel).
+            if (last && c5Boundary && x > 0) {
+                static const int p1Token = [] { const char *v = std::getenv("CASE5_XOR_P1TOKEN"); return v ? std::atoi(v) : -1; }();
+                if (p1Token >= 0) mod |= SBID(int8_t(p1Token));
             }
 
             if (hhbase + ksys < opCount && rc == 8) mod |= Fwd;
@@ -602,7 +675,10 @@ void Generator<hw>::outerProductSystolic(int h, int ha_period, int hb_period, in
                     rcount++;
                 else {
                     if (strategy.dpasw && y < ny && rcount > 0 && rcount != dpaswTile) stub();
-                    if (A0.isValid()) issueDPAS(false);
+                    if (A0.isValid()) {
+                        issueDPAS(false);
+                        if (c5Interleaved) case5FoldEmitSpread(false);   // CASE5_XOR_SPREAD ops
+                    }
                     AS0 = AS; BS0 = BS;
                     A0 = A; B0 = B; C0 = C; rcount = 1;
                     A0.setType(Ta.ngen());
@@ -619,6 +695,21 @@ void Generator<hw>::outerProductSystolic(int h, int ha_period, int hb_period, in
 
         bool finishChain = !strategy.extendedAtomicFMA || c5Boundary || (x + osys >= nx) || (repackC && x >= (Cr_unrollX - 2*xinc));
         issueDPAS(finishChain);
+        if (c5Interleaved) case5FoldEmitSpread(false);   // CASE5_XOR_SPREAD ops
+        // Debug (CASE5_DBG_PAD=n): n independent ALU instructions after every finished chain, to
+        // measure what an ALU issue slot costs next to the dpas stream (null destination, r2 source).
+        // CASE5_DBG_PAD=n after a finished chain; CASE5_DBG_PAD_AT=p0|p1 restricts it to the boundary after the
+        // first / last row pass, CASE5_DBG_PAD_STEP=n to the n-th k-step of the body.
+        if (finishChain) {
+            static const int dbgPad = [] { const char *v = std::getenv("CASE5_DBG_PAD"); return v ? std::atoi(v) : 0; }();
+            static const int dbgPadAt = [] {
+                const char *v = std::getenv("CASE5_DBG_PAD_AT");
+                return !v ? -1 : (!std::strcmp(v, "p0") ? 0 : 1);
+            }();
+            const bool lastX = (x + osys >= nx);
+            if ((dbgPadAt < 0 || (dbgPadAt == 0 && x == 0) || (dbgPadAt == 1 && lastX)) && dbgPadStepOk)
+                dbgPadEmit(dbgPad);
+        }
         // Case5 interleaved tile XOR: fold work at dpas chain boundaries (no {Atomic} pending here).
         if (c5Interleaved && finishChain)
             gemmCase5TileXorChainHook(problem, strategy, state, h, opCount, x, nx, osys, globalCM, false, c5XafStep);

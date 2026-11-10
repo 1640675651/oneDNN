@@ -231,6 +231,9 @@ protected:
     void case5FoldEmitOp(int kind, int exec, const ngen::RegData &dst, const ngen::RegData &a,
                          const ngen::RegData &b);
     void case5FoldEmitPending();
+    void case5FoldEmitSpread(bool flush);
+    bool case5FoldSpreadPending();
+    bool case5FoldSpreadFollows();
     bool case5TileXorFastStoreOk(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
     void case5FoldSubtileFull(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
                               const ngen::GRF &foldReg, int sr, int sc);
@@ -241,7 +244,7 @@ protected:
     void case5TileXorGather(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state, bool reduce,
                             bool msIncremented);
     void case5TileXorSend(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
-                          bool msIncremented);
+                          bool msIncremented, bool notAtMsZero = false);
     void case5JumpIfPhase(GEMMState &state, bool phaseB, ngen::Label &target);
     void case5TileXorIndex(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
                            const ngen::Subregister &dst, const ngen::Subregister &sid, const ngen::Subregister &slot,

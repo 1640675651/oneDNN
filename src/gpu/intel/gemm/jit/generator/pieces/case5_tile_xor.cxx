@@ -40,6 +40,25 @@ bool g_c5FoldRecord = false;
 int g_c5FoldChain = 0, g_c5FoldChainNext = 0;
 std::vector<Case5FoldOp> g_c5FoldOps;
 bool case5EnvOn(const char *name, bool def) { const char *v = std::getenv(name); return v ? v[0] != '0' : def; }
+// CASE5_XOR_SPREAD=n (Xe2 experiment): a fold is not emitted as one block at the chain boundary but
+// queued (round-robin order), and outerProductSystolic emits n of its ops after every dpas it issues
+// during the following row pass (such a dpas is not marked {Atomic}); the hook that needs the fold
+// complete flushes the rest. The ALU work then sits between the thread's own dpas issues, the only
+// place where Xe2 hides it (case5_xmx_coissue: a block after a chain, or another thread's ALU, costs
+// its full issue time; ops interleaved with the thread's dpas are free).
+std::vector<Case5FoldOp> g_c5SpreadQueue;
+bool g_c5SpreadArm = false;
+int g_c5SpreadDpas = 0;        // dpas issued since the queue was armed
+int case5SpreadPerDpas() {
+    static const int n = [] { const char *v = std::getenv("CASE5_XOR_SPREAD"); return v ? std::atoi(v) : 0; }();
+    return n;
+}
+// CASE5_XOR_SPREAD_EVERY=m: emit the ops after every m-th dpas only (the dpas in between keep their
+// {Atomic} macro); default 1.
+int case5SpreadEvery() {
+    static const int m = [] { const char *v = std::getenv("CASE5_XOR_SPREAD_EVERY"); return v ? std::max(1, std::atoi(v)) : 1; }();
+    return m;
+}
 }
 
 template <HW hw>
@@ -404,8 +423,16 @@ void Generator<hw>::gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMM
             const int accGrfs = (GRF::bytes(hw) == 32 || twoGrf) ? 2 : 1;
             state.tileXorFoldWide.resize(nFolds);
             bool ok = true;
+            // One-GRF accumulators come out of one range, so a 16-lane operand can cover the halves of two
+            // neighbours (the 8-instruction reduction in case5TileXorGather); the handles stay per fold.
+            GRFRange all;
+            if (accGrfs == 1 && nFolds > 1)
+                all = state.ra.try_alloc_range(nFolds, getHint(HintType::LongTerm, strategy));
             for (int i = 0; i < nFolds; i++) {
-                state.tileXorFoldWide[i] = state.ra.try_alloc_range(accGrfs, getHint(HintType::LongTerm, strategy));
+                if (all.isValid())
+                    state.tileXorFoldWide[i] = GRFRange(all.getBase() + i, 1);
+                else
+                    state.tileXorFoldWide[i] = state.ra.try_alloc_range(accGrfs, getHint(HintType::LongTerm, strategy));
                 ok = ok && state.tileXorFoldWide[i].isValid();
             }
             if (!ok) {
@@ -486,8 +513,9 @@ void Generator<hw>::gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMM
         const int grfPerLine = std::max(1, B * 4 / GRF::bytes(hw));
         state.tileXorLineBlock = B;
         // The rotating line update reads one dword past the last line (pad GRF); the indirect slot
-        // write (CASE5_XOR_LINE_IDX, 64-byte GRFs, default on in the miner: the Xe2 32x64 kernel is one
-        // GRF short with the pad) does not. Same conditions as the gather below.
+        // write (CASE5_XOR_LINE_IDX, 64-byte GRFs; default on as in the miner since 2026-11-10: eight
+        // scalar writes draw less power than eight 16-dword line rotations) does not. Same conditions as
+        // the gather below.
         const bool lineIdx = GRF::bytes(hw) == 64 && case5EnvOn("CASE5_XOR_LINE_IDX", true) && B > 1
                 && grfPerLine == 1 && nFolds <= 8;
         state.tileXorLineBuf = state.ra.try_alloc_range(grfPerLine * nFolds + (lineIdx ? 0 : 1),
@@ -703,7 +731,10 @@ void Generator<hw>::gemmCase5TileXorStore(const GEMMProblem &problem, const GEMM
         const char *bpos = std::getenv("CASE5_XOR_BPOS");
         const bool bAtChain = bpos && !std::strcmp(bpos, "chain");
         const int osysB = systolicParams(problem).osys;
-        if (!bAtChain && state.tileXorPhase.isValid() && strategy.unroll[LoopM] > osysB) {
+        // With static all-a phases nothing runs here: emitting the block behind an unconditional jmpi
+        // cost one taken branch per milestone (CASE5_XOR_PHASEB_STUB=1 restores it for comparison).
+        const bool phaseBCode = state.tileXorPhaseMode != 0 || case5EnvOn("CASE5_XOR_PHASEB_STUB", false);
+        if (!bAtChain && state.tileXorPhase.isValid() && strategy.unroll[LoopM] > osysB && phaseBCode) {
             // Phase B: fold everything now (rows final), gather into the store GRF; the send itself
             // goes out at the next pass-0 boundary together with phase A (CASE5_XOR_BSEND=here to
             // store immediately).
@@ -1734,9 +1765,49 @@ void Generator<hw>::case5FoldEmitPending()
     for (auto &c : chains) maxLen = std::max(maxLen, c.size());
     for (size_t k = 0; k < maxLen; k++)
         for (auto &c : chains)
-            if (k < c.size()) case5FoldEmitOp(c[k]->kind, c[k]->exec, c[k]->dst, c[k]->a, c[k]->b);
+            if (k < c.size()) {
+                if (g_c5SpreadArm)
+                    g_c5SpreadQueue.push_back(*c[k]);
+                else
+                    case5FoldEmitOp(c[k]->kind, c[k]->exec, c[k]->dst, c[k]->a, c[k]->b);
+            }
+    g_c5SpreadArm = false;
     g_c5FoldOps.clear();
     g_c5FoldChainNext = 0;
+}
+
+template <HW hw>
+bool Generator<hw>::case5FoldSpreadPending()
+{
+    return !g_c5SpreadQueue.empty();
+}
+
+// True when fold ops will be emitted right after the dpas about to be issued.
+template <HW hw>
+bool Generator<hw>::case5FoldSpreadFollows()
+{
+    return !g_c5SpreadQueue.empty() && ((g_c5SpreadDpas + 1) % case5SpreadEvery()) == 0;
+}
+
+// Emit CASE5_XOR_SPREAD queued fold ops (all of them when flush), in queue order. Called after every
+// dpas issued (flush = false) and where the fold must be complete (flush = true).
+template <HW hw>
+void Generator<hw>::case5FoldEmitSpread(bool flush)
+{
+    if (!flush) {
+        g_c5SpreadDpas++;
+        if ((g_c5SpreadDpas % case5SpreadEvery()) != 0) return;
+    }
+    const size_t per = size_t(std::max(0, case5SpreadPerDpas()));
+    const size_t n = flush ? g_c5SpreadQueue.size() : std::min(g_c5SpreadQueue.size(), per);
+    // Debug CASE5_XOR_SPREAD_DROP=1: discard the ops (wrong results) but keep the dpas de-atomized
+    // exactly as with them, to price the broken macros alone.
+    static const bool drop = case5EnvOn("CASE5_XOR_SPREAD_DROP", false);
+    for (size_t i = 0; i < n && !drop; i++) {
+        const auto &o = g_c5SpreadQueue[i];
+        case5FoldEmitOp(o.kind, o.exec, o.dst, o.a, o.b);
+    }
+    g_c5SpreadQueue.erase(g_c5SpreadQueue.begin(), g_c5SpreadQueue.begin() + n);
 }
 
 template <HW hw>
@@ -1813,6 +1884,24 @@ void Generator<hw>::case5TileXorGather(const GEMMProblem &problem, const GEMMStr
         if (W[0].getLen() == 2)   // 2-GRF accumulators (CASE5_XOR_SIMD32 / CASE5_XOR_ACC2): fold the halves
             for (int i = 0; i < n; i++)
                 xor_(16, W[i][0].ud(), W[i][0].ud(), W[i][1].ud());
+        // CASE5_XOR_GATHER8 (default on): eight contiguous accumulators reduce in 8 instructions instead of
+        // 15, every operand a 16-lane region over two neighbouring GRFs (each instruction costs power, and
+        // under the card's power cap that is clock: note.md 2026-11-10):
+        //   16 -> 8: W[j]   = (W[2j], W[2j+1]) lanes [0,8) ^ [8,16)        4 x (16)  -> [a8|b8]
+        //    8 -> 4: W[4+j] = (W[2j], W[2j+1]) (8;4,1) ^ (8;4,1)+4         2 x (16)  -> [a4|b4|c4|d4]
+        //    4 -> 2: W[0]   = (W[4], W[5]) (4;2,1) ^ (4;2,1)+2             1 x (16)  -> 2 lanes per fold
+        //    2 -> 1: data   = W[0] (2;1,0) ^ (2;1,0)+1                     1 x (8)
+        bool contiguous = (n == 8) && W[0].getLen() == 1;
+        for (int i = 1; i < n && contiguous; i++)
+            contiguous = W[i].getLen() == 1 && W[i].getBase() == W[0].getBase() + i;
+        if (contiguous && case5EnvOn("CASE5_XOR_GATHER8", true)) {
+            for (int j = 0; j < 4; j++)
+                xor_(16, W[j][0].ud(), W[2 * j][0].ud(0)(16, 8, 1), W[2 * j][0].ud(8)(16, 8, 1));
+            for (int j = 0; j < 2; j++)
+                xor_(16, W[4 + j][0].ud(), W[2 * j][0].ud(0)(8, 4, 1), W[2 * j][0].ud(4)(8, 4, 1));
+            xor_(16, W[0][0].ud(), W[4][0].ud(0)(4, 2, 1), W[4][0].ud(2)(4, 2, 1));
+            xor_(8, data.ud(0)(1), W[0][0].ud(0)(2, 1, 0), W[0][0].ud(1)(2, 1, 0));
+        } else {
         for (int i = 0; i < n; i++)
             xor_(8, W[i / 2][0].ud(8 * (i % 2))(1), W[i][0].ud(0)(1), W[i][0].ud(8)(1));
         for (int r = 0; r < c1; r++)
@@ -1820,6 +1909,7 @@ void Generator<hw>::case5TileXorGather(const GEMMProblem &problem, const GEMMStr
         for (int q = 0; q < c2; q++)
             xor_(8, W[q / 2][0].ud(8 * (q % 2))(1), W[c1 + q][0].ud(0)(4, 2, 1), W[c1 + q][0].ud(2)(4, 2, 1));
         xor_(np, data.ud(0)(1), W[0][0].ud(0)(2, 1, 0), W[0][0].ud(1)(2, 1, 0));
+        }
     } else {
         for (int fi = 0; fi < nFolds; fi++) {
             GRF f = state.tileXorFolds[fi];
@@ -1867,7 +1957,7 @@ void Generator<hw>::case5TileXorGather(const GEMMProblem &problem, const GEMMStr
 
 template <HW hw>
 void Generator<hw>::case5TileXorSend(const GEMMProblem &problem, const GEMMStrategy &strategy,
-                                     GEMMState &state, bool msIncremented)
+                                     GEMMState &state, bool msIncremented, bool notAtMsZero)
 {
     const int subGridM = (problem.case5XorSubGridM > 0) ? problem.case5XorSubGridM : 1;
     const int subGridN = (problem.case5XorSubGridN > 0) ? problem.case5XorSubGridN : 1;
@@ -1881,8 +1971,17 @@ void Generator<hw>::case5TileXorSend(const GEMMProblem &problem, const GEMMStrat
         const int grfPerLine = std::max(1, B * 4 / GRF::bytes(hw));
         Label lSkip;
         auto t = state.ra.alloc_sub<uint32_t>();
-        and_(1, t, state.tileXorMs, uint16_t(B - 1));
-        cmp(1 | ne | state.flagCase5Xor, t, uint16_t(msIncremented ? 0 : (B - 1)));
+        if (notAtMsZero && msIncremented) {
+            // The caller runs in every milestone, the first included (no "milestone 0" branch in front):
+            // flush when the previous milestone (tileXorMs - 1) closed a block; in the first milestone
+            // that index is 0xFFFFFFFF, which the sign bit in the mask rejects.
+            add(1, t, state.tileXorMs, int16_t(-1));
+            and_(1, t, t, uint32_t(0x80000000u | uint32_t(B - 1)));
+            cmp(1 | ne | state.flagCase5Xor, t, uint32_t(B - 1));
+        } else {
+            and_(1, t, state.tileXorMs, uint16_t(B - 1));
+            cmp(1 | ne | state.flagCase5Xor, t, uint16_t(msIncremented ? 0 : (B - 1)));
+        }
         state.ra.safeRelease(t);
         jmpi(1 | state.flagCase5Xor, lSkip);
         if (problem.case5TileXorAccSlm && state.tileXorAccSlmOff.isValid()) {
@@ -2122,21 +2221,78 @@ void Generator<hw>::gemmCase5TileXorChainHook(const GEMMProblem &problem, const 
     // step, are folded at the start of the next milestone's first step, before its first chain
     // (right after the barrier, while the step's loads are in flight), instead of after pass 0 of
     // the last step. The final flush then folds all rows.
+    // With the hybrid xaf chains (XeHPG) it is allowed too: the last step stays split into two chains but
+    // has no work between them (see CASE5_XOR_P1TOKEN; no gain measured). With whole-step chains
+    // everywhere (CASE5_XOR_XAF=1) the pre-chain hook of the first step then folds the whole tile: all
+    // rows are final once the last step's chain has completed, which the step's B loads wait for anyway
+    // (they overwrite that chain's operands), so the fold runs in the load latency.
     const char *topAtEnv = std::getenv("CASE5_XOR_TOPAT");
-    const bool topPrechain = topAtEnv && !std::strcmp(topAtEnv, "prechain") && !strategy.extendedAtomicFMA
+    const bool topPrechain = topAtEnv && !std::strcmp(topAtEnv, "prechain")
             && !singlePass && state.tileXorPhaseMode == 0;
     // Debug: CASE5_XOR_FOLD=0 drops the fold work, CASE5_XOR_GATHER=0 the reduction / line / store
     // (both break the result; they attribute the cost).
     const bool dbgFold = case5EnvOn("CASE5_XOR_FOLD", true), dbgGather = case5EnvOn("CASE5_XOR_GATHER", true);
+    // Debug: CASE5_XOR_FOLD_SKIP=top|bottom drops one half-tile fold of the block placement (breaks the
+    // result; attributes the cost to the half after its own pass / the half after the next pass 0).
+    const char *fsEnv = std::getenv("CASE5_XOR_FOLD_SKIP");
+    const bool skipTop = fsEnv && !std::strcmp(fsEnv, "top");
+    const bool skipBottom = fsEnv && !std::strcmp(fsEnv, "bottom");
+    const int subM = (problem.case5XorSubM > 0) ? problem.case5XorSubM : strategy.unroll[LoopM];
+    const int subGridM = (problem.case5XorSubGridM > 0) ? problem.case5XorSubGridM : 1;
+    const int subGridN = (problem.case5XorSubGridN > 0) ? problem.case5XorSubGridN : 1;
+    auto foldAt = [&](int sr, int sc) { return state.tileXorFolds[sr * subGridN + sc]; };
+    // CASE5_XOR_GATHER_AT=step1 (see below) is computed here because the spread mode excludes it.
+    const char *gaEnv = std::getenv("CASE5_XOR_GATHER_AT");
+    const bool gatherStep1 = gaEnv && !std::strcmp(gaEnv, "step1") && !strategy.extendedAtomicFMA
+            && !singlePass && state.tileXorPhaseMode == 0 && unrollK >= 3 * opCount;
+    // CASE5_XOR_SPREAD=n: per-pass chains (af), phase-A threads, standard fold placement only.
+    const bool spread = case5SpreadPerDpas() > 0 && !xaf && !singlePass && state.tileXorPhaseMode == 0
+            && !topPrechain && !gatherStep1 && dbgFold && !strategy.extendedAtomicFMA;
+    // The two half-tile folds. spreadIt: queue the ops for outerProductSystolic instead of emitting.
+    auto spreadBegin = [&]() {
+        g_c5FoldRecord = true; g_c5FoldOps.clear(); g_c5FoldChainNext = 0; g_c5SpreadArm = true; g_c5SpreadDpas = 0;
+    };
+    auto bottomRows = [&](bool spreadIt) {
+        if (spreadIt) spreadBegin(); else rrBegin();
+        for (int sr = 0; sr < subGridM; sr++) {
+            const int rb = std::max(0, osys - sr * subM), re = subM;
+            if (re <= rb) continue;
+            const bool init = (sr * subM >= osys);
+            for (int sc = 0; sc < subGridN; sc++)
+                case5FoldSubtileRows(problem, strategy, state, foldAt(sr, sc), sr, sc, rb, re, init);
+        }
+        if (spreadIt) case5FoldEmitPending(); else rrEnd();
+    };
+    auto topRows = [&](bool spreadIt) {
+        if (spreadIt) spreadBegin(); else rrBegin();
+        for (int sr = 0; sr < subGridM; sr++) {
+            const int re = std::min(subM, osys - sr * subM);
+            if (re <= 0) continue;
+            for (int sc = 0; sc < subGridN; sc++)
+                case5FoldSubtileRows(problem, strategy, state, foldAt(sr, sc), sr, sc, 0, re, true);
+        }
+        if (spreadIt) case5FoldEmitPending(); else rrEnd();
+    };
     if (preChain) {
         if (!firstStep || singlePass) return;
+        if (spread) {
+            // The previous milestone's bottom rows, issued between the dpas of pass 0 (which only
+            // writes the top rows). Harmless in the first milestone: the gather below is skipped.
+            bottomRows(true);
+            return;
+        }
         if (!xaf && !topPrechain) return;
-        const int subM = (problem.case5XorSubM > 0) ? problem.case5XorSubM : strategy.unroll[LoopM];
-        const int subGridM = (problem.case5XorSubGridM > 0) ? problem.case5XorSubGridM : 1;
-        const int subGridN = (problem.case5XorSubGridN > 0) ? problem.case5XorSubGridN : 1;
         Label lSkip;
-        cmp(1 | eq | state.flagCase5Xor, state.tileXorMs, uint16_t(0));
-        jmpi(1 | state.flagCase5Xor, lSkip);
+        // CASE5_XOR_NOBRANCH: the upper rows of the first milestone are still zero and whatever they fold
+        // to leaves the line before the first flush (see the first-step boundary below).
+        // Default on with whole-step chains as well (XeHPG: a cmp + jmpi costs ~3 cycles of XMX time).
+        const bool preNoBranch = case5EnvOn("CASE5_XOR_NOBRANCH", hw >= HW::Xe2 || xaf) && !spread
+                && problem.case5XorLayout == 2 && state.tileXorLineBuf.isValid() && state.tileXorLineBlock >= 2
+                && !case5EnvOn("CASE5_XOR_GATHER_LATE", false) && !gatherStep1;
+        if (!preNoBranch) {
+            cmp(1 | eq | state.flagCase5Xor, state.tileXorMs, uint16_t(0));
+            jmpi(1 | state.flagCase5Xor, lSkip);
+        }
         if (!xaf) {
             if (dbgFold) {
                 rrBegin();
@@ -2152,18 +2308,24 @@ void Generator<hw>::gemmCase5TileXorChainHook(const GEMMProblem &problem, const 
             mark(lSkip);
             return;
         }
-        rrBegin();
-        for (int sr = 0; sr < subGridM; sr++) {
-            const int rb = std::max(0, osys - sr * subM), re = subM;
-            if (re <= rb) continue;
-            const bool init = (sr * subM >= osys);
-            for (int sc = 0; sc < subGridN; sc++)
-                case5FoldSubtileRows(problem, strategy, state, state.tileXorFolds[sr * subGridN + sc], sr, sc, rb, re,
-                                     init);
+        // Whole-step chains: the lower rows (the upper ones were folded at the end of the last step), or
+        // with CASE5_XOR_TOPAT=prechain the whole tile.
+        if (dbgFold) {
+            rrBegin();
+            for (int sr = 0; sr < subGridM; sr++) {
+                const int rb = topPrechain ? 0 : std::max(0, osys - sr * subM), re = subM;
+                if (re <= rb) continue;
+                const bool init = topPrechain || (sr * subM >= osys);
+                for (int sc = 0; sc < subGridN; sc++)
+                    case5FoldSubtileRows(problem, strategy, state, state.tileXorFolds[sr * subGridN + sc], sr, sc, rb,
+                                         re, init);
+            }
+            rrEnd();
         }
-        rrEnd();
-        case5TileXorGather(problem, strategy, state, true, true);
-        case5TileXorSend(problem, strategy, state, true);
+        if (dbgGather) {
+            case5TileXorGather(problem, strategy, state, true, true);
+            case5TileXorSend(problem, strategy, state, true, preNoBranch);
+        }
         mark(lSkip);
         return;
     }
@@ -2171,17 +2333,9 @@ void Generator<hw>::gemmCase5TileXorChainHook(const GEMMProblem &problem, const 
     // the first step (where the bottom-rows fold sits) to the pass-0 boundary of the second step, so
     // each cluster runs under its own freshly issued dpas pass. Needs per-pass chains in the middle
     // steps (af, not xaf), at least 3 steps per milestone and phase-A threads.
-    const char *gaEnv = std::getenv("CASE5_XOR_GATHER_AT");
     const bool secondStep = ((h % unrollK) == opCount);
-    const bool gatherStep1 = gaEnv && !std::strcmp(gaEnv, "step1") && !strategy.extendedAtomicFMA
-            && !singlePass && state.tileXorPhaseMode == 0 && unrollK >= 3 * opCount;
     if (!lastStep && !firstStep && !(secondStep && gatherStep1)) return;
     if (!firstPass && !lastPass) return;
-
-    const int subM = (problem.case5XorSubM > 0) ? problem.case5XorSubM : strategy.unroll[LoopM];
-    const int subGridM = (problem.case5XorSubGridM > 0) ? problem.case5XorSubGridM : 1;
-    const int subGridN = (problem.case5XorSubGridN > 0) ? problem.case5XorSubGridN : 1;
-    auto foldAt = [&](int sr, int sc) { return state.tileXorFolds[sr * subGridN + sc]; };
 
     if (secondStep && firstPass && gatherStep1) {
         Label lSkip;
@@ -2192,48 +2346,58 @@ void Generator<hw>::gemmCase5TileXorChainHook(const GEMMProblem &problem, const 
         mark(lSkip);
     }
 
-    auto bottomRows = [&]() {
-        rrBegin();
-        for (int sr = 0; sr < subGridM; sr++) {
-            const int rb = std::max(0, osys - sr * subM), re = subM;
-            if (re <= rb) continue;
-            const bool init = (sr * subM >= osys);
-            for (int sc = 0; sc < subGridN; sc++)
-                case5FoldSubtileRows(problem, strategy, state, foldAt(sr, sc), sr, sc, rb, re, init);
-        }
-        rrEnd();
-    };
-    auto topRows = [&]() {
-        rrBegin();
-        for (int sr = 0; sr < subGridM; sr++) {
-            const int re = std::min(subM, osys - sr * subM);
-            if (re <= 0) continue;
-            for (int sc = 0; sc < subGridN; sc++)
-                case5FoldSubtileRows(problem, strategy, state, foldAt(sr, sc), sr, sc, 0, re, true);
-        }
-        rrEnd();
-    };
-
     // CASE5_XOR_GATHER_LATE=1: the reduction / line update / store move from the pass-0 boundary of
     // the first step (where the bottom-rows fold already sits) to its last-pass boundary, so the two
     // clusters overlap different dpas chains. Phase-A threads only (phase B gathers at the step end).
     const bool gatherLate = (case5EnvOn("CASE5_XOR_GATHER_LATE", false) || gatherStep1) && !singlePass
             && state.tileXorPhaseMode == 0;
+    // CASE5_XOR_NOBRANCH (default on for Xe2): see the first-step boundary below. Needs the tile-major line buffers with a
+    // block of at least two milestones (the garbage word of the first milestone must never be flushed)
+    // and static all-a phases.
+    const char *sendAtEnv = std::getenv("CASE5_XOR_SEND_AT");
+    const bool sendLate = sendAtEnv && !std::strcmp(sendAtEnv, "p1");
+    const bool noBranch = case5EnvOn("CASE5_XOR_NOBRANCH", hw >= HW::Xe2) && state.tileXorPhaseMode == 0 && !spread
+            && !gatherLate && !singlePass && problem.case5XorLayout == 2 && state.tileXorLineBuf.isValid()
+            && state.tileXorLineBlock >= 2;
     if (firstStep && firstPass && !singlePass) {
         // Phase A threads finish the previous milestone (rows [osys, unrollM) still intact);
         // nothing is pending in the first iteration.
         Label lSkip, lSend;
-        cmp(1 | eq | state.flagCase5Xor, state.tileXorMs, uint16_t(0));
-        jmpi(1 | state.flagCase5Xor, lSkip);
+        if (spread) case5FoldEmitSpread(true);     // the rest of the queued bottom-rows fold
+        // CASE5_XOR_WAITP0 (default on for Xe2): this boundary's work reads nothing pass 0 wrote, so it
+        // would issue while that chain is still in the pipe, and pass 1 would then be issued detached
+        // from it. On Xe2 that starves the pipe (one instruction here costs 2% of pure GEMM); work that
+        // first waits for the pass-0 chain is free (case5_xve_issue, note.md 2026-11-10). The dependency
+        // rides on the next instruction: no instruction is added. Not measured on XeHPG yet.
+        if (case5EnvOn("CASE5_XOR_WAITP0", hw >= HW::Xe2)) {
+            const int lastCol = strategy.unroll[LoopN] - 1;
+            wrdep(GRF(state.C_layout.find(0, lastCol, state.C_regs[0]).getBase()));
+        }
         const char *bsend = std::getenv("CASE5_XOR_BSEND");
         const bool bSendHere = bsend && !std::strcmp(bsend, "here");
-        case5JumpIfPhase(state, true, bSendHere ? lSkip : lSend);   // phase B: gathered already
-        if (dbgFold) bottomRows();
-        if (!gatherLate && dbgGather) case5TileXorGather(problem, strategy, state, true, true);
-        mark(lSend);
-        if (!gatherLate && dbgGather) case5TileXorSend(problem, strategy, state, true);
-        mark(lSkip);
+        if (noBranch) {
+            // CASE5_XOR_NOBRANCH: no "first milestone" test. In the first milestone this folds the still
+            // empty bottom rows and gathers garbage into every line; that word has left the line (or
+            // its slot has been rewritten) by the first flush, B milestones later, and the flush test
+            // itself is false in the first milestone. A jmpi here stalls its thread ~23 cycles.
+            if (dbgFold && !skipBottom) bottomRows(false);
+            if (dbgGather) case5TileXorGather(problem, strategy, state, true, true);
+            if (dbgGather && !sendLate) case5TileXorSend(problem, strategy, state, true, true);
+        } else {
+            cmp(1 | eq | state.flagCase5Xor, state.tileXorMs, uint16_t(0));
+            jmpi(1 | state.flagCase5Xor, lSkip);
+            case5JumpIfPhase(state, true, bSendHere ? lSkip : lSend);   // phase B: gathered already
+            if (dbgFold && !spread && !skipBottom) bottomRows(false);
+            if (!gatherLate && dbgGather) case5TileXorGather(problem, strategy, state, true, true);
+            mark(lSend);
+            if (!gatherLate && dbgGather) case5TileXorSend(problem, strategy, state, true);
+            mark(lSkip);
+        }
     }
+    // CASE5_XOR_SEND_AT=p1 (with CASE5_XOR_NOBRANCH): the flush test and the line stores after pass 1 of
+    // the first step, where a jmpi and the sends are off the pass-0 -> pass-1 path.
+    if (firstStep && lastPass && !singlePass && noBranch && sendLate && dbgGather)
+        case5TileXorSend(problem, strategy, state, true, true);
     if (firstStep && lastPass && gatherLate && !gatherStep1 && dbgGather) {
         Label lSkip;
         cmp(1 | eq | state.flagCase5Xor, state.tileXorMs, uint16_t(0));
@@ -2245,18 +2409,24 @@ void Generator<hw>::gemmCase5TileXorChainHook(const GEMMProblem &problem, const 
     const char *topAt = topAtEnv;
     const bool topAtPass0 = !(topAt && !std::strcmp(topAt, "end")) && !xaf && !topPrechain;
     if (lastStep && firstPass && !singlePass && topAtPass0 && dbgFold) {
-        // (debug) phase A folds rows [0, osys) right after pass 0: waits for that chain to retire.
-        Label lSkip;
-        case5JumpIfPhase(state, true, lSkip);
-        topRows();
-        mark(lSkip);
+        if (spread) {
+            // Rows [0, osys), final after pass 0, queued: issued between the dpas of pass 1.
+            topRows(true);
+        } else {
+            // (debug) phase A folds rows [0, osys) right after pass 0: waits for that chain to retire.
+            Label lSkip;
+            case5JumpIfPhase(state, true, lSkip);
+            if (!skipTop) topRows(false);
+            mark(lSkip);
+        }
     }
+    if (spread && lastStep && lastPass) case5FoldEmitSpread(true);   // the rest of the top-rows fold
     if (lastStep && lastPass && !singlePass && !topAtPass0 && !topPrechain && dbgFold) {
         // Phase A folds rows [0, osys) at the end of the step: pass 0 retired while pass 1 issued,
         // so the reads do not stall, and the xors overlap the in-flight pass-1 chain.
         Label lSkip;
         case5JumpIfPhase(state, true, lSkip);
-        topRows();
+        if (!skipTop) topRows(false);
         mark(lSkip);
     }
     const char *bposEnv = std::getenv("CASE5_XOR_BPOS");
@@ -2338,8 +2508,7 @@ void Generator<hw>::gemmCase5TileXorFinalFlush(const GEMMProblem &problem, const
         const bool rr = case5EnvOn("CASE5_XOR_RR", true);
         // CASE5_XOR_TOPAT=prechain left the upper rows of the last milestone unfolded as well.
         const char *topAtEnv = std::getenv("CASE5_XOR_TOPAT");
-        const bool topPrechain = topAtEnv && !std::strcmp(topAtEnv, "prechain") && !strategy.extendedAtomicFMA
-                && state.tileXorPhaseMode == 0;
+        const bool topPrechain = topAtEnv && !std::strcmp(topAtEnv, "prechain") && state.tileXorPhaseMode == 0;
         if (rr) { g_c5FoldRecord = true; g_c5FoldOps.clear(); g_c5FoldChainNext = 0; }
         for (int sr = 0; sr < subGridM; sr++) {
             const int rb = topPrechain ? 0 : std::max(0, osys - sr * subM), re = subM;
