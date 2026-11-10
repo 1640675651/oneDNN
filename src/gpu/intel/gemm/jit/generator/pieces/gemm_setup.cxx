@@ -1824,7 +1824,40 @@ bool Generator<hw>::gemmAccumulateCSetup(GEMMProblem &problem, GEMMStrategy &str
     }
 
     // Allocate data registers.
+    GRF case5Pad;
+    if (problem.case5RegPadAt >= 0) {
+        case5Pad = GRF(problem.case5RegPadAt);
+        state.ra.claim(case5Pad);
+    }
     gemmAllocRegs(problem, strategy, state);
+    if (case5Pad.isValid())
+        state.ra.safeRelease(case5Pad);
+    if (problem.case5TileXor && hw == HW::XeHPG && !strategy.systolic) {
+        // dp4a operands: report a block starting on an odd GRF (see case5OperandOddGrf).
+        bool odd = false;
+        auto check = [&](const GRFMultirange &mr) {
+            for (auto &r : mr.ranges)
+                if (r.isValid() && r.getLen() >= 2 && (r.getBase() & 1)) {
+                    if (!odd) case5OperandOddBase() = r.getBase();
+                    odd = true;
+                }
+        };
+        for (auto &mr : state.A_regs) check(mr);
+        for (auto &mr : state.B_regs) check(mr);
+        check(state.Ar_regs);
+        check(state.Br_regs);
+        if (std::getenv("CASE5_DEBUG_RA")) {
+            auto dump = [&](const char *n, const GRFMultirange &mr) {
+                for (auto &r : mr.ranges) if (r.isValid()) std::fprintf(stderr, "[case5 ra] %s r%d+%d\n", n, r.getBase(), r.getLen());
+            };
+            for (auto &mr : state.A_regs) dump("A", mr);
+            for (auto &mr : state.B_regs) dump("B", mr);
+            dump("Ar", state.Ar_regs); dump("Br", state.Br_regs);
+            for (auto &mr : state.C_regs) dump("C", mr);
+            std::fprintf(stderr, "[case5 ra] odd=%d pad_at=%d\n", int(odd), problem.case5RegPadAt);
+        }
+        case5OperandOddGrf() = odd;
+    }
     gemmAllocAoBoRegs(strategy, state);
 
     // Allocate address registers for A/B loads. We don't need C addresses yet.
@@ -2795,6 +2828,21 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
     if (strategy.fuseBeta || strategy.fusePostOps)
         state.inputs.statusBuffer = interface.getArgumentIfExists("status");
 
+    if (problem.case5TileXor) {
+        state.inputs.tileXor = interface.getArgumentIfExists("tile_xor");
+        state.inputs.surfaceTileXor = interface.getArgumentSurfaceIfExists("tile_xor");
+        state.inputs.tileCount = interface.getArgumentIfExists("tile_count");
+        state.inputs.tileCols = interface.getArgumentIfExists("tile_cols");
+        state.inputs.xorPeriod = interface.getArgumentIfExists("xor_period");
+        if (problem.case5TileXorBlake3) {
+            state.inputs.blake3Out = interface.getArgumentIfExists("blake3_out");
+            for (int i = 0; i < 8; i++) {
+                state.inputs.blake3KeyWords[i] =
+                        interface.getArgumentIfExists("blake3_k" + std::to_string(i));
+            }
+        }
+    }
+
     size_t poCount = problem.postOps.len();
     state.inputs.binarySrcs.resize(poCount);
     state.inputs.binaryOffsets.resize(poCount);
@@ -3077,6 +3125,25 @@ void Generator<hw>::gemmInitInterface(GEMMProblem &problem, GEMMStrategy &strate
 
     if (strategy.fuseBeta || strategy.fusePostOps)
         state.ra.claim(state.inputs.statusBuffer);
+
+    if (problem.case5TileXor) {
+        if (state.inputs.tileXor.isValid())
+            state.ra.claim(state.inputs.tileXor);
+        if (state.inputs.tileCount.isValid())
+            state.ra.claim(state.inputs.tileCount);
+        if (state.inputs.tileCols.isValid())
+            state.ra.claim(state.inputs.tileCols);
+        if (state.inputs.xorPeriod.isValid())
+            state.ra.claim(state.inputs.xorPeriod);
+        if (problem.case5TileXorBlake3) {
+            if (state.inputs.blake3Out.isValid())
+                state.ra.claim(state.inputs.blake3Out);
+            for (int i = 0; i < 8; i++) {
+                if (state.inputs.blake3KeyWords[i].isValid())
+                    state.ra.claim(state.inputs.blake3KeyWords[i]);
+            }
+        }
+    }
 
     // Binary-related arguments are not claimed here, but instead
     //  are reloaded later in the kernel when needed.

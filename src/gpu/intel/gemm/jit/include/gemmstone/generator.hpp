@@ -213,6 +213,65 @@ protected:
     void gemmKReduce(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
     void gemmPrefetchC(const GEMMProblem &problem, GEMMStrategy &strategy, GEMMState &state);
 
+    void gemmCase5TileXorStore(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
+    void gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
+    void gemmCase5TileXorIterationInit(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                       GEMMState &state);
+    void case5UpdateTileXorSpatialIdFromIds(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                            GEMMState &state, const ngen::Subregister &idM,
+                                            const ngen::Subregister &idN);
+    void gemmCase5TileXorFoldChunk(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                   GEMMState &state, int chunkIdx, int numChunks);
+    void gemmCase5TileXorChainHook(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                                   int h, int opCount, int x, int nx, int osys, bool globalCM,
+                                   bool preChain = false, bool xafStep = false);
+    void gemmCase5TileXorFinalFlush(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
+    void case5FoldSubtileRows(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                              const ngen::GRF &foldReg, int sr, int sc, int rowBegin, int rowEnd, bool init);
+    void case5FoldEmitOp(int kind, int exec, const ngen::RegData &dst, const ngen::RegData &a,
+                         const ngen::RegData &b);
+    void case5FoldEmitPending();
+    bool case5TileXorFastStoreOk(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
+    void case5FoldSubtileFull(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                              const ngen::GRF &foldReg, int sr, int sc);
+    void case5InitTileXorPhase(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                               const ngen::Subregister &idM, const ngen::Subregister &idN);
+    void case5TileXorFastStore(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                               bool reduce, bool msIncremented);
+    void case5TileXorGather(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state, bool reduce,
+                            bool msIncremented);
+    void case5TileXorSend(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                          bool msIncremented);
+    void case5JumpIfPhase(GEMMState &state, bool phaseB, ngen::Label &target);
+    void case5TileXorIndex(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                           const ngen::Subregister &dst, const ngen::Subregister &sid, const ngen::Subregister &slot,
+                           int slots);
+    void gemmCase5TileXorFlushFromSlm(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                      GEMMState &state);
+    void gemmCase5TileXorFlushFromGrf(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                      GEMMState &state);
+    void gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                       GEMMState &state);
+    void gemmCase5ReleaseAccForBlake3(const GEMMStrategy &strategy, GEMMState &state);
+    void case5TileXorLoadAccFromSlm(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
+    void case5ZeroFoldGrfs(const GEMMStrategy &strategy, GEMMState &state, int nFolds);
+    void case5InitTileXorSlmMatrix(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                   GEMMState &state);
+    void case5SlmMatrixStore(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                             const ngen::Subregister &ms, int fi, const ngen::GRF &data);
+    void case5SlmMatrixLoad(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                            int ms, int fi, const ngen::GRF &data);
+    void case5SlmDwordStore(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                            const ngen::Subregister &byteOff, const ngen::GRF &data);
+    void case5SlmDwordLoad(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state,
+                           const ngen::Subregister &byteOff, const ngen::GRF &data);
+    void case5EmitTileXorSlmByteOff(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                    GEMMState &state, const ngen::Subregister &out,
+                                    const ngen::Subregister &ms, int fi);
+    void case5EmitTileXorSlmByteOffConstMs(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                           GEMMState &state, const ngen::Subregister &out, int ms,
+                                           int fi);
+
     void setupCAddr0(ngen::GRFRange (&C_addr0)[2], ngen::GRFRange (&C_addr0Unmasked)[2], const RegisterLayout &C_layout, const RegisterLayout &C_layoutUnmasked, int C_count, const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state, const Address2DParams *params = nullptr);
 
     // common.cxx

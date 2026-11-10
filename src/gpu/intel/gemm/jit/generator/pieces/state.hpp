@@ -225,11 +225,18 @@ struct GEMMState : public CommonState {
         ngen::Subregister flags;                            // ud
         ngen::Subregister diagA, diagB, diagC;              // q
         ngen::Subregister statusBuffer;                     // q
+        ngen::Subregister tileXor;                          // q or surface via BTS
+        ngen::Subregister blake3Out;                        // q global digest out (8 u32 / tile)
+        ngen::Subregister blake3KeyWords[8];                // ud keyed hash key (8 u32)
+        ngen::Subregister tileCount;                        // d  (# spatial tiles)
+        ngen::Subregister tileCols;                         // d  (# tiles in N direction)
+        ngen::Subregister xorPeriod;                        // d  (panels between XOR; 1 = every unrollK)
         uint8_t surfaceA, surfaceAO, surfaceAScale;         // BTS indices
         uint8_t surfaceB, surfaceBO, surfaceBScale;         // BTS indices
         uint8_t surfaceAg, surfaceBg;                       // BTS
         uint8_t surfaceC[2], surfaceCO, surfaceTempC;       // BTS
         uint8_t surfaceCScale;                              // BTS
+        uint8_t surfaceTileXor = 0x80;                      // BTS (0x80 = none)
         std::vector<ngen::Subregister> strideA;             // ud, used for strided batch.
         std::vector<ngen::Subregister> strideB;             // ud
         std::vector<ngen::Subregister> strideC;             // ud
@@ -309,6 +316,33 @@ struct GEMMState : public CommonState {
     ngen::Subregister unclampedI0;                          // d
     ngen::Subregister ctiShiftJ0;                           // d
     ngen::Subregister threadK0, k0Rem, wgK;                 // ud
+    ngen::Subregister tileXorMs;                             // ud milestone index
+    ngen::Subregister tileXorPanel;                          // ud panel counter (1 after first panel)
+    ngen::Subregister spatialId;                            // ud
+    ngen::Subregister tileXorLocalId;                       // ud (idM%wgM) + (idN%wgN)*wgM at prologue
+    ngen::Subregister tileXorSlmOff;                        // ud running SLM byte offset (CASE5_XOR_ADDR=inc)
+    ngen::Subregister tileXorRow;                           // ud thread tile row (split path)
+    ngen::Subregister tileXorCol;                           // ud thread tile col (split path)
+    ngen::GRF tileXorFold;                                  // optional scratch if preallocated
+    std::vector<ngen::GRF> tileXorFolds;                    // one fold GRF per logical sub-tile (split path)
+    std::vector<ngen::GRF> tileXorWrapGrf;                  // Case5.5: 2 GRF per fold (8 u32 each)
+    RegisterLayout tileXorSlmLayout;                        // 1x1 u32 scattered SLM (storeMatrix path)
+    std::vector<ngen::GRFRange> tileXorSlmAddrs;
+    ngen::FlagRegister flagCase5Xor;                        // KR-period gate (not flagAP)
+    ngen::GRFRange tileXorStoreHdr;                         // fast store: running A64 pointer in uq(0)
+    ngen::GRF tileXorStoreData;                             // fast store: gathered fold dwords
+    ngen::GRF tileXorStoreBase;                             // fast store: running pointer copied into the header per send
+    ngen::Subregister tileXorCountBytes;                    // fast store: tile_count * 4
+    ngen::Subregister tileXorPhase;                         // interleaved: 1 = fold at step end (phase B)
+    int tileXorPhaseMode = 0;                               // 0 all phase A, 1 all phase B, 2 per-thread
+    ngen::GRFRange tileXorPairTmp;                          // interleaved: 2 GRF SIMD16 fold scratch
+    std::vector<ngen::GRFRange> tileXorFoldWide;            // interleaved: 2 GRF (16 lane) accumulator per sub-tile
+    ngen::GRFRange tileXorLineBuf;                          // tile-major store: subGridN lines of tileXorLineBlock dwords (+1 pad GRF)
+    std::vector<ngen::GRFRange> tileXorLineHdr;             // tile-major store: one A64 header per sub-tile line
+    bool tileXorLineHdrPacked = false;                      // tile-major store: the line addresses are qwords of tileXorLineHdr[0], sent via tileXorStoreHdr
+    int tileXorLineBlock = 0;                               // tile-major store: milestones per flushed line (8 or 16)
+    ngen::GRFRange tileXorFoldAcc;                          // Case5.5a: 16-word folded message per sub-tile (2 GRFs each)
+    ngen::Subregister tileXorAccSlmOff;                     // Case5.7: this thread's SLM byte base for its message line blocks
     ngen::Subregister remainders[3];                        // d (todo: w)
     ngen::Subregister remaindersFused[2];                   // w
     ngen::Subregister remaindersWG[2];                      // d (todo: w)
