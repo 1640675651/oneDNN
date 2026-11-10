@@ -227,11 +227,24 @@ struct GEMMState : public CommonState {
         ngen::Subregister diagA, diagB, diagC;              // q
         ngen::Subregister statusBuffer;                     // q
         ngen::Subregister tileXor;                          // q or surface via BTS
-        ngen::Subregister blake3Out;                        // q global digest out (8 u32 / tile)
-        ngen::Subregister blake3KeyWords[8];                // ud keyed hash key (8 u32)
         ngen::Subregister tileCount;                        // d  (# spatial tiles)
         ngen::Subregister tileCols;                         // d  (# tiles in N direction)
         ngen::Subregister xorPeriod;                        // d  (panels between XOR; 1 = every unrollK)
+        ngen::Subregister blake3Out;                        // q global digest out (8 u32 / tile)
+        ngen::Subregister blake3CmpDump;                    // q per-tile u32[65]: dig, bound, cmp, f1_gt/lt, jmpi fall, reach_store
+        ngen::Subregister blake3KeyWords[8];                // ud keyed hash key (8 u32)
+        ngen::Subregister blake3BoundWords[8];              // ud target digest (8 u32)
+        ngen::Subregister blake3BoundBuf;                    // q global target digest (legacy)
+        ngen::Subregister jackpotKeyWords[8];               // ud (BLAKE3 key)
+        ngen::Subregister jackpotBoundWords[8];             // ud (unused; bound via jackpotBoundBuf)
+        ngen::Subregister jackpotBoundBuf;                    // q  (global target digest, 8 dwords)
+        ngen::Subregister jackpotDigestBuf;                 // q  (panel digest out: w*tile_count+spatial)
+        ngen::Subregister jackpotMsgBuf;                    // q  (panel folded msg out: w*tile_count+spatial)
+        ngen::Subregister foundFlag;                        // q  (found flag + coord slots)
+        ngen::Subregister trBase;                           // d
+        ngen::Subregister tcBase;                           // d
+        ngen::Subregister hashMr;                           // d
+        ngen::Subregister hashNr;                           // d
         uint8_t surfaceA, surfaceAO, surfaceAScale;         // BTS indices
         uint8_t surfaceB, surfaceBO, surfaceBScale;         // BTS indices
         uint8_t surfaceAg, surfaceBg;                       // BTS
@@ -346,8 +359,11 @@ struct GEMMState : public CommonState {
     std::vector<ngen::GRFRange> tileXorLineHdr;             // tile-major store: one A64 header per sub-tile line
     bool tileXorLineHdrPacked = false;                      // tile-major store: the line addresses are qwords of tileXorLineHdr[0], sent via tileXorStoreHdr
     int tileXorLineBlock = 0;                               // tile-major store: milestones per flushed line (8 or 16)
-    ngen::GRFRange tileXorFoldAcc;                          // Case5.5a: 16-word folded message per sub-tile (2 GRFs each)
+    ngen::GRFRange tileXorFoldAcc;                          // fold16: 16-word folded message per sub-tile (2 GRFs each)
     ngen::Subregister tileXorAccSlmOff;                     // Case5.7: this thread's SLM byte base for its message line blocks
+    ngen::Subregister tileXorLidFlat;                       // ud flat local thread id (cooperative jackpot)
+    bool tileXorCoopJudge = false;                          // cooperative jackpot: found/tr/tc arguments bound
+    bool tileXorCoopDigestOut = false;                      // cooperative jackpot: blake3_out argument bound
     ngen::Subregister remainders[3];                        // d (todo: w)
     ngen::Subregister remaindersFused[2];                   // w
     ngen::Subregister remaindersWG[2];                      // d (todo: w)

@@ -15,8 +15,14 @@
 *******************************************************************************/
 
 
+#include "alloc_utils.hpp"
 #include "atomic_fusions.hpp"
 #include "cooperative_split.hpp"
+#include <iostream>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdlib>
 #include "gemmstone/generator.hpp"
 #include "gemmstone/problem.hpp"
 #include "gemmstone/strategy.hpp"
@@ -422,24 +428,52 @@ void Generator<hw>::gemm(GEMMProblem &problem, GEMMStrategy &strategy, GEMMState
 
     if (problem.case5TileXor) {
         if (problem.case5JackpotArgsInBuf) {
-            // Case 5.6: the key comes from blake3_out's header; release its registers before the Case 5
-            // prologue and the k loop allocate, so they land as in Case 5.5 (XeHPG dp4a: otherwise the A
-            // operand block can start on an odd GRF). Same scheme as CPPminer's CASE5_JACKPOT_ARGBUF.
-            for (int i = 0; i < 8; i++)
-                state.ra.safeRelease(state.inputs.blake3KeyWords[i]);
+            // Wrap-GRF fused jackpot: key, bound and tile bases travel in the found buffer (cooperative-path
+            // layout) and the epilogue reloads them. Release their registers before the Case 5 prologue and
+            // the k loop allocate, so those allocations land where they do in the separate jackpot instead
+            // of after the longer argument list (XeHPG dp4a: A on an odd GRF / in B's bundle otherwise).
+            auto &in = state.inputs;
+            for (int i = 0; i < 8; i++) {
+                state.ra.safeRelease(in.blake3KeyWords[i]);
+                state.ra.safeRelease(in.blake3BoundWords[i]);
+            }
+            state.ra.safeRelease(in.trBase);
+            state.ra.safeRelease(in.tcBase);
+        }
+        if (problem.case5JackpotCoop && hw >= HW::Xe2) {
+            // Same for the cooperative (own-tile) judge on Xe2: released after gemmCase5TileXorAlloc they
+            // left holes below the Case 5 registers, and the 32x64 kernel's k loop then found no room for
+            // a register bundle ("Insufficient registers in requested bundle"). The judge flag is taken
+            // first; gemmCase5TileXorCoopStageArgs releases the rest after the spatial ids. XeHPG keeps
+            // the original order (its 16x64 kernel is tuned to the resulting register placement).
+            auto &in = state.inputs;
+            state.tileXorCoopJudge = in.foundFlag.isValid() && in.trBase.isValid() && in.tcBase.isValid();
+            for (int i = 0; i < 8; i++) {
+                state.ra.safeRelease(in.blake3KeyWords[i]);
+                state.ra.safeRelease(in.blake3BoundWords[i]);
+            }
+            state.ra.safeRelease(in.foundFlag);
+            state.ra.safeRelease(in.trBase);
+            state.ra.safeRelease(in.tcBase);
         }
         gemmCase5TileXorAlloc(problem, strategy, state);
         case5UpdateTileXorSpatialIdFromIds(problem, strategy, state, idM, idN);
+        if (problem.case5JackpotCoop)
+            gemmCase5TileXorCoopStageArgs(problem, strategy, state);
+        if (problem.case5JackpotArgsInBuf) {
+            // tile_cols / tile_count were needed for the spatial id above; see the release before
+            // gemmCase5TileXorAlloc for the rest.
+            state.ra.safeRelease(state.inputs.tileCols);
+            state.ra.safeRelease(state.inputs.tileCount);
+            state.ra.safeRelease(state.inputs.xorPeriod);
+        }
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "after tileXorAlloc", state.ra.countAllocedRegisters());
         if (std::getenv("CASE5_DEBUG_RA")) {
-            auto pr = [](const char *n, const ngen::Subregister &s) {
-                if (s.isValid()) std::fprintf(stderr, "  %s=r%d.%d", n, s.getBase(), s.getOffset());
-            };
-            std::fprintf(stderr, "[ra] after tileXorAlloc: %d GRFs", state.ra.countAllocedRegisters());
-            pr("tileXor", state.inputs.tileXor); pr("tileCount", state.inputs.tileCount);
-            pr("tileCols", state.inputs.tileCols); pr("xorPeriod", state.inputs.xorPeriod);
-            pr("blake3Out", state.inputs.blake3Out); pr("k0", state.inputs.blake3KeyWords[0]);
-            pr("k7", state.inputs.blake3KeyWords[7]);
-            std::fprintf(stderr, "\n");
+            auto pr = [](const char *n, const ngen::Subregister &s) { if (s.isValid()) std::fprintf(stderr, "  %s=r%d.%d", n, s.getBase(), s.getOffset()); };
+            pr("tileXor", state.inputs.tileXor); pr("tileCount", state.inputs.tileCount); pr("tileCols", state.inputs.tileCols); pr("xorPeriod", state.inputs.xorPeriod);
+            pr("blake3Out", state.inputs.blake3Out); pr("k0", state.inputs.blake3KeyWords[0]); pr("k7", state.inputs.blake3KeyWords[7]);
+            pr("found", state.inputs.foundFlag); pr("tr", state.inputs.trBase); pr("tc", state.inputs.tcBase); pr("b0", state.inputs.blake3BoundWords[0]); pr("b7", state.inputs.blake3BoundWords[7]);
+            std::fprintf(stderr, "%s", "\n");
         }
     }
 
@@ -989,7 +1023,17 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
     auto &remN = state.remainders[LoopN];
 
     // Accumulate C with panel*panel multiply.
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "before accumulateC", state.ra.countAllocedRegisters());
+    if (std::getenv("CASE5_DEBUG_RA") && std::getenv("CASE5_DEBUG_RA")[0] == '2') {
+        std::string map;
+        for (int r = 0; r < state.ra.getRegisterCount(); r++) {
+            if (r && !(r % 32)) map += '\n'; else if (r && !(r % 8)) map += ' ';
+            map += state.ra.isFree(GRF(r)) ? '.' : ((state.ra.isFree(GRF(r).ud(0)) || state.ra.isFree(GRF(r).ud(7))) ? '/' : 'x');
+        }
+        std::fprintf(stderr, "[ra] map (r0 top-left, 32 per row):\n%s\n", map.c_str());
+    }
     if (!gemmAccumulateC(problem, strategy, state)) return false;
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "after accumulateC", state.ra.countAllocedRegisters());
 
     // Final C horizontal reduction for dot product kernels.
     gemmDotReduce(problem, strategy, state);
@@ -1039,6 +1083,7 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
     }
 
     // Case5 interleaved XMX fold: finish and store the last milestone (C_regs still live).
+        if (std::getenv("CASE5_DEBUG_RA")) std::fprintf(stderr, "[ra] %s: %d GRFs\n", "before finalFlush", state.ra.countAllocedRegisters());
     if (problem.case5TileXor && problem.case5TileXorInterleaved)
         gemmCase5TileXorFinalFlush(problem, strategy, state);
 
@@ -1046,6 +1091,7 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
     if (problem.case5TileXor && problem.case5TileXorSlm)
         gemmCase5TileXorFlushFromSlm(problem, strategy, state);
     else if (problem.case5TileXor && problem.case5TileXorBlake3) {
+        // Fold stays in wrap-GRF; BLAKE3 consumes it in-register. Only digests hit global.
         gemmCase5TileXorBlake3FromGrf(problem, strategy, state);
     } else if (problem.case5TileXor && problem.case5TileXorWrapGrf
              && problem.case5TileXorWrapGrfStoreMode == 2 && !problem.case5TileXorInterleaved)   // interleaved: the final flush stored the accumulators
@@ -1062,7 +1108,6 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
         }
     } else if (problem.case5TileXor && !problem.case5TileXorSlm) {
         // Case5 / 5.4 wrap / 5.5 wrapGrf: tile_xor written in K-loop or GRF epilogue flush.
-        // Case5.6: only blake3_out written; wrap XOR stays in GRF until BLAKE3 epilogue.
     } else {
         // Regular C update into memory.
         if (!gemmUpdateCDispatch(problem, strategy, state)) return false;

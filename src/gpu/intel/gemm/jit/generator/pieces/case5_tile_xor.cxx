@@ -85,6 +85,10 @@ void Generator<hw>::case5InitTileXorSlmMatrix(const GEMMProblem &problem, const 
 
 namespace {
 
+constexpr int kFoldRotl = 13;
+constexpr int kFoldRotlShr = 32 - kFoldRotl;
+constexpr int kWrapGrfPerFold = 2;
+
 inline int case5XorOutputMilestoneCount(const GEMMProblem &problem) {
     if (!problem.case5TileXorWrap) {
         return std::max(1, problem.case5XorMaxMilestones);
@@ -272,10 +276,9 @@ void Generator<hw>::case5UpdateTileXorSpatialIdFromIds(const GEMMProblem &proble
     const int subGridN = (problem.case5XorSubGridN > 0) ? problem.case5XorSubGridN : 1;
     const bool split = (subGridM > 1) || (subGridN > 1);
 
-    if (split) {
-        mov(1, state.tileXorRow, idM);
-        mov(1, state.tileXorCol, idN);
-    }
+    // Always keep gemm tile (row, col) for jackpot coords — avoid float divMod(spatial).
+    mov(1, state.tileXorRow, idM);
+    mov(1, state.tileXorCol, idN);
     emad(1, state.spatialId, idN, idM, state.inputs.tileCols, strategy, state);
     if (split && state.tileXorStoreHdr.isValid()) {
         auto lr = state.ra.alloc_sub<uint32_t>();
@@ -368,17 +371,25 @@ void Generator<hw>::gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMM
 
     state.tileXorMs = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
     state.tileXorPanel = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
-    state.spatialId = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
+    // Full GRFs: alloc_sub parents get reused by later ra.alloc() and clobber spat/row/col.
+    state.spatialId = state.ra.alloc(getHint(HintType::LongTerm, strategy)).ud(0);
     if (problem.case5TileXorSlm || problem.case5TileXorAccSlm)
         state.tileXorLocalId = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
+    state.tileXorRow = state.ra.alloc(getHint(HintType::LongTerm, strategy)).ud(0);
+    state.tileXorCol = state.ra.alloc(getHint(HintType::LongTerm, strategy)).ud(0);
+    if (problem.case5JackpotCoop) {
+        // Flat local thread id (lidN * wgM + lidM): names this thread's tiles in the SLM tables of
+        // the cooperative jackpot epilogue (the saved local ids are released before then).
+        // No extra GRF: the 16x64 strategy is at the register limit, so the flat local id lives in the
+        // second dword of the (full) tileXorRow GRF, whose other dwords are never written.
+        state.tileXorLidFlat = GRF(state.tileXorRow.getBase()).ud(1);
+        mul(1, state.tileXorLidFlat, state.lidN, uint16_t(strategy.wg[LoopM]));
+        add(1, state.tileXorLidFlat, state.tileXorLidFlat, state.lidM);
+    }
     if (problem.case5TileXorSlm && (!problem.case5TileXorWrap || case5WrapAtFlush(problem)) && !split
             && case5AddrInc())
         state.tileXorSlmOff = state.ra.try_alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
         // (invalid if registers are tight: the store then recomputes the offset as before)
-    if (split) {
-        state.tileXorRow = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
-        state.tileXorCol = state.ra.alloc_sub<uint32_t>(getHint(HintType::LongTerm, strategy));
-    }
     const int nFolds = split ? (subGridM * subGridN) : 1;
     // Interleaved XMX fold: one 16-lane accumulator per sub-tile (2 GRFs on 32-byte GRFs, 1 on Xe2) so
     // the SIMD16 bfn chain accumulates directly (no per-chunk collapse) and the scalars come out of one
@@ -475,8 +486,10 @@ void Generator<hw>::gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMM
         const int grfPerLine = std::max(1, B * 4 / GRF::bytes(hw));
         state.tileXorLineBlock = B;
         // The rotating line update reads one dword past the last line (pad GRF); the indirect slot
-        // write (CASE5_XOR_LINE_IDX, 64-byte GRFs) does not.
-        const bool lineIdx = GRF::bytes(hw) == 64 && case5EnvOn("CASE5_XOR_LINE_IDX", false);
+        // write (CASE5_XOR_LINE_IDX, 64-byte GRFs, default on in the miner: the Xe2 32x64 kernel is one
+        // GRF short with the pad) does not. Same conditions as the gather below.
+        const bool lineIdx = GRF::bytes(hw) == 64 && case5EnvOn("CASE5_XOR_LINE_IDX", true) && B > 1
+                && grfPerLine == 1 && nFolds <= 8;
         state.tileXorLineBuf = state.ra.try_alloc_range(grfPerLine * nFolds + (lineIdx ? 0 : 1),
                                                         getHint(HintType::LongTerm, strategy));
         // The wrap cases never store a line from the loop (blocks are accumulated; 5.4 / 5.5 store the
@@ -537,8 +550,8 @@ void Generator<hw>::gemmCase5TileXorAlloc(const GEMMProblem &problem, const GEMM
         throw std::runtime_error("Case5 interleaved XOR needs the fast store path (split sub-tiles on the "
                                  "tile-major layout or a 1x4/1x8 row on [ms][tile], A64)");
     if (problem.case5TileXorWrapGrf && !wrapAcc) {
-        state.tileXorWrapGrf.resize(2 * nFolds);
-        for (int i = 0; i < 2 * nFolds; i++)
+        state.tileXorWrapGrf.resize(kWrapGrfPerFold * nFolds);
+        for (int i = 0; i < kWrapGrfPerFold * nFolds; i++)
             state.tileXorWrapGrf[i] = state.ra.alloc(getHint(HintType::LongTerm, strategy));
     }
     if (problem.case5TileXorSlm)
@@ -562,7 +575,7 @@ void Generator<hw>::gemmCase5TileXorIterationInit(const GEMMProblem &problem, co
     mov(1, state.tileXorMs, uint16_t(0));
     // CASE5_XOR_LINE_IDX (64-byte GRFs): a0.8..15 = line byte offsets 0, 64, .., 448 for the indirect
     // slot write in case5TileXorGather (a0 is otherwise unused inside the k loop).
-    if (GRF::bytes(hw) == 64 && case5EnvOn("CASE5_XOR_LINE_IDX", false) && problem.case5XorLayout == 2
+    if (GRF::bytes(hw) == 64 && case5EnvOn("CASE5_XOR_LINE_IDX", true) && problem.case5XorLayout == 2
             && state.tileXorLineBuf.isValid() && state.tileXorLineBlock > 1) {
         mov(8, a0[8](1), Immediate::uv(0, 1, 2, 3, 4, 5, 6, 7));
         shl(8, a0[8](1), a0[8](8, 8, 1), uint16_t(6));
@@ -1057,13 +1070,37 @@ void Generator<hw>::gemmCase5TileXorStore(const GEMMProblem &problem, const GEMM
             return;
         }
         if (wrapGrf) {
-            const GRF &wrapBase = state.tileXorWrapGrf[fi * 2];
+            const GRF &wrapBase = state.tileXorWrapGrf[fi * kWrapGrfPerFold];
             auto byteOff = state.ra.alloc_sub<uint32_t>();
             mov(1, a0[0], wrapBase.getBase() * GRF::bytes(hw));
             shl(1, byteOff, slotMs, uint16_t(2));
             add(1, a0[0], a0[0], byteOff);
+
+            auto xorContributionIntoWrap = [&]() {
+                if (problem.case5FuseJackpot || problem.case5TileXorBlake3
+                        || problem.case5TileXorWrapGrf) {
+                    // fold_milestones semantics (cp_jackpot / cp_onednn_jackpot): rotl slot then xor x.
+                    auto slotVal = state.ra.alloc_sub<uint32_t>();
+                    mov(1, slotVal, indirect[a0].ud(0));
+                    auto rotHi = state.ra.alloc_sub<uint32_t>();
+                    shr(1, rotHi, slotVal, uint16_t(kFoldRotlShr));
+                    shl(1, slotVal, slotVal, uint16_t(kFoldRotl));
+                    or_(1, slotVal, slotVal, rotHi);
+                    xor_(1, slotVal, slotVal, foldReg.ud(0));
+                    mov(1, indirect[a0].ud(0), slotVal);
+                    state.ra.safeRelease(rotHi);
+                    state.ra.safeRelease(slotVal);
+                    return;
+                }
+                GRF contribution = foldReg;
+                bool releaseContribution = false;
+                xor_(1, indirect[a0].ud(0), indirect[a0].ud(0), contribution.ud(0));
+                if (releaseContribution)
+                    state.ra.safeRelease(contribution);
+            };
+
             if (wrapGrfStageUnified) {
-                xor_(1, indirect[a0].ud(0), indirect[a0].ud(0), foldReg.ud(0));
+                xorContributionIntoWrap();
                 if (wrapGrfStoreInLoop) {
                     Label lSkipWrapGrfStore;
                     cmp(1 | lt | state.flagCase5Xor, state.tileXorMs, uint16_t(outputMs));
@@ -1079,7 +1116,7 @@ void Generator<hw>::gemmCase5TileXorStore(const GEMMProblem &problem, const GEMM
                 mov(1, indirect[a0].ud(0), foldReg.ud(0));
                 jmpi(1, lWrapGrfHybridDone);
                 mark(lWrapGrfHybridSecondHalf);
-                xor_(1, foldReg.ud(0), foldReg.ud(0), indirect[a0].ud(0));
+                xorContributionIntoWrap();
                 if (wrapGrfStoreInLoop)
                     storeFoldAtIdx(idx, slotMs, foldReg, fi);
                 mark(lWrapGrfHybridDone);
@@ -1383,11 +1420,17 @@ void Generator<hw>::gemmCase5TileXorFlushFromGrf(const GEMMProblem &problem, con
     GRF fold = state.tileXorFold.isValid() ? state.tileXorFold : state.ra.alloc();
     const bool releaseFold = !state.tileXorFold.isValid();
 
+    Label labelSkipFlush;
+    if (state.inputs.tileCount.isValid() && state.spatialId.isValid()) {
+        cmp(1 | ge | f0[0], state.spatialId, state.inputs.tileCount);
+        jmpi(1 | f0[0], labelSkipFlush);
+    }
+
     // The slot is a compile-time constant here: read the subregister directly. (Going through
     // a0 cost an address-register write-to-use stall per slot.)
     const int dwPerGrf = elementsPerGRF(hw, DataType::ud);
     auto loadWrapGrfAtSlot = [&](int slot, int fi, const GRF &dst) {
-        const GRF &w = state.tileXorWrapGrf[fi * 2 + slot / dwPerGrf];
+        const GRF &w = state.tileXorWrapGrf[fi * kWrapGrfPerFold + slot / dwPerGrf];
         mov(1, dst.ud(0), w.ud(slot % dwPerGrf));
     };
 
@@ -1459,6 +1502,7 @@ void Generator<hw>::gemmCase5TileXorFlushFromGrf(const GEMMProblem &problem, con
             state.ra.safeRelease(idxs[fi]);
     }
 
+    mark(labelSkipFlush);
     if (releaseFold)
         state.ra.safeRelease(fold);
 }
@@ -1791,7 +1835,7 @@ void Generator<hw>::case5TileXorGather(const GEMMProblem &problem, const GEMMStr
         // The new scalar goes to dword B-1, so after B milestones dwords 0..B-1 hold them in order.
         const int B = state.tileXorLineBlock;
         const int grfPerLine = std::max(1, B * 4 / GRF::bytes(hw));
-        if (GRF::bytes(hw) == 64 && case5EnvOn("CASE5_XOR_LINE_IDX", false) && B > 1 && grfPerLine == 1
+        if (GRF::bytes(hw) == 64 && case5EnvOn("CASE5_XOR_LINE_IDX", true) && B > 1 && grfPerLine == 1
                 && nFolds <= 8) {
             // Indirect slot write instead of rotating every line by one dword: a0.8..15 hold the line
             // byte offsets 0, 64, .., 448 (set per tile in gemmCase5TileXorInit), a0.fi = a0.(8+fi) +
@@ -2240,8 +2284,8 @@ void Generator<hw>::gemmCase5TileXorChainHook(const GEMMProblem &problem, const 
 }
 
 // Case 5.7: after the k loop, fold the SLM-staged line blocks of each sub-tile into its 16-word message
-// (Case 5.5a: msg = rotl(msg, 13) ^ block, wrap cases: xor), in registers the finished C tile no longer
-// needs. The stores (5.5a) and the hash (5.6) then read tileXorFoldAcc as they always did.
+// (fold16: msg = rotl(msg, 13) ^ block, wrap cases: xor), in registers the finished C tile no longer
+// needs. The stores, the judges and the hash then read tileXorFoldAcc as they always did.
 template <HW hw>
 void Generator<hw>::case5TileXorLoadAccFromSlm(const GEMMProblem &problem, const GEMMStrategy &strategy,
                                                GEMMState &state)
@@ -2311,12 +2355,14 @@ void Generator<hw>::gemmCase5TileXorFinalFlush(const GEMMProblem &problem, const
         case5TileXorSend(problem, strategy, state, true);
         mark(lSkip);
     }
+    // Folded message / interleaved 5.4 and 5.5: every block has been folded; write each sub-tile's
+    // 16-word message (or wrapped slots) as one line, or hand the messages to the cooperative jackpot.
     // Case 5.7: fold the SLM-staged blocks into the message now (C is finished, its registers are free).
-    if (problem.case5TileXorAccSlm && !problem.case5TileXorBlake3)
+    if (problem.case5TileXorAccSlm && (problem.case5JackpotCoop || !problem.case5TileXorBlake3))
         case5TileXorLoadAccFromSlm(problem, strategy, state);
-    // Case 5.5a / interleaved 5.4 and 5.5: every block has been folded; write each sub-tile's 16-word
-    // message (or wrapped slots) as one line. Case 5.6 hashes the accumulators instead.
-    if (state.tileXorFoldAcc.isValid() && !problem.case5TileXorBlake3) {
+    if (state.tileXorFoldAcc.isValid() && problem.case5JackpotCoop) {
+        gemmCase5TileXorJackpotCoop(problem, strategy, state);
+    } else if (state.tileXorFoldAcc.isValid() && !problem.case5TileXorBlake3) {
         const int grfPerLine = std::max(1, 16 * 4 / GRF::bytes(hw));
         if (!state.tileXorLineHdr.empty()) {
             for (int fi = 0; fi < subGridM * subGridN; fi++) {
@@ -2329,7 +2375,7 @@ void Generator<hw>::gemmCase5TileXorFinalFlush(const GEMMProblem &problem, const
                       GRFRange(state.tileXorFoldAcc.getBase() + fi * grfPerLine, grfPerLine));
             }
         } else {
-            // Wrap cases (no headers kept in the loop): sub-tile (sr, sc) of this thread is spatial id
+            // No headers kept in the loop (fold16, wrap): sub-tile (sr, sc) of this thread is spatial id
             // (row * subGridM + sr) * tile_cols + col * subGridN + sc, 16 words each in tile_xor.
             const int subGridN = (problem.case5XorSubGridN > 0) ? problem.case5XorSubGridN : 1;
             auto hdr = state.ra.alloc_range(2);
