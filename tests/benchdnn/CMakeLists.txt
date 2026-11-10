@@ -32,6 +32,12 @@ include_directories_with_host_compiler(
     ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
+# Level Zero Sysman types for GPU frequency sampling. The library adds these
+# headers for SYCL and L0 runtimes only.
+if(DNNL_GPU_VENDOR STREQUAL "INTEL" AND DNNL_GPU_RUNTIME STREQUAL "OCL")
+    include_directories_with_host_compiler(${DNNL_ZE_INCLUDE_DIR})
+endif()
+
 if(BENCHDNN_USE_RDPMC)
     add_definitions_with_host_compiler(-DBENCHDNN_USE_RDPMC)
 endif()
