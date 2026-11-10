@@ -15,6 +15,9 @@
 *******************************************************************************/
 
 
+#include <cstdlib>
+#include <cstring>
+
 #include "compute_utils.hpp"
 #include "gemmstone/generator.hpp"
 #include "hw_utils.hpp"
@@ -428,7 +431,23 @@ void Generator<hw>::outerProductSystolic(int h, int ha_period, int hb_period, in
     if (opCount > ksys || snake)
         ny1 = rcountMax * (strategy.dpasw ? 2 : 1);
 
+    // Case5 interleaved tile XOR under xaf (whole step one atomic chain). Default (hybrid): the
+    // per-pass chains (and the pass-0 fold hooks) only in the first and last step of a milestone,
+    // the whole-step chain elsewhere. CASE5_XOR_XAF=1 keeps xaf everywhere and folds the lower rows
+    // right before the next step's chain instead.
+    const bool c5Interleaved = problem.case5TileXor && problem.case5TileXorInterleaved;
+    bool c5Boundary = false;
+    if (c5Interleaved && strategy.extendedAtomicFMA) {
+        const char *xm = std::getenv("CASE5_XOR_XAF");
+        const int uk = strategy.unroll[LoopK];
+        if (!(xm && xm[0] == '1'))
+            c5Boundary = ((h % uk) == 0) || (((h + opCount) % uk) == 0);
+    }
+    const bool c5XafStep = strategy.extendedAtomicFMA && !c5Boundary;
+
     for (int x = 0; x < nx; x += xinc) {
+        if (c5Interleaved && x == 0)   // pre-chain hook: xaf lower rows, or CASE5_XOR_TOPAT=prechain upper rows
+            gemmCase5TileXorChainHook(problem, strategy, state, h, opCount, x, nx, osys, globalCM, true, c5XafStep);
         Subregister A0, B0, C0;
         RegData AS, BS, AS0, BS0;
         int rcount = 0, ybase = 0, hhbase = 0;
@@ -598,8 +617,18 @@ void Generator<hw>::outerProductSystolic(int h, int ha_period, int hb_period, in
         } /* y loop */
         } /* oncomp loop */
 
-        bool finishChain = !strategy.extendedAtomicFMA || (x + osys >= nx) || (repackC && x >= (Cr_unrollX - 2*xinc));
+        bool finishChain = !strategy.extendedAtomicFMA || c5Boundary || (x + osys >= nx) || (repackC && x >= (Cr_unrollX - 2*xinc));
         issueDPAS(finishChain);
+        // Debug (CASE5_DBG_PAD=n): n independent ALU instructions after every finished chain, to
+        // measure what an ALU issue slot costs next to the dpas stream (null destination, r2 source).
+        if (finishChain) {
+            static const int dbgPad = [] { const char *v = std::getenv("CASE5_DBG_PAD"); return v ? std::atoi(v) : 0; }();
+            for (int i = 0; i < dbgPad; i++)
+                add(16, null.ud(), GRF(2).ud(), uint32_t(i + 1));
+        }
+        // Case5 interleaved tile XOR: fold work at dpas chain boundaries (no {Atomic} pending here).
+        if (c5Interleaved && finishChain)
+            gemmCase5TileXorChainHook(problem, strategy, state, h, opCount, x, nx, osys, globalCM, false, c5XafStep);
 
         if (endRepackC) {
             int xr = x - Cr_unrollX + xinc;

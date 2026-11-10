@@ -20,11 +20,73 @@
 #include "gemmstone/driver_info.hpp"
 #include "hw_utils.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
 GEMMSTONE_NAMESPACE_START
 
 using namespace ngen;
 using namespace ngen::utils;
 
+static int case5XorOutputMilestoneCount(const GEMMProblem &problem) {
+    if (!problem.case5TileXorWrap) {
+        return std::max(1, problem.case5XorMaxMilestones);
+    }
+    if (problem.case5XorOutputMilestones > 0) {
+        return problem.case5XorOutputMilestones;
+    }
+    return std::max(1, problem.case5XorMaxMilestones / 2);
+}
+
+bool case5WrapAtFlush(const GEMMProblem &problem)
+{
+    static const bool atFlush = [] {
+        const char *v = std::getenv("CASE5_XOR_WRAP_AT");
+        return !(v && v[0] && !std::strcmp(v, "loop"));
+    }();
+    return atFlush && problem.case5TileXorWrap && problem.case5TileXorSlm && !problem.case5TileXorWrapGrf;
+}
+
+int case5XorSlmSlotMs(const GEMMProblem &problem)
+{
+    return case5WrapAtFlush(problem) ? std::max(1, problem.case5XorMaxMilestones)
+                                     : case5XorOutputMilestoneCount(problem);
+}
+
+static size_t case5TileXorSlmBytesPerWG(const GEMMProblem &problem, const GEMMStrategy &strategy)
+{
+    if (!problem.case5TileXor || !problem.case5TileXorSlm)
+        return 0;
+    const int nFolds = std::max(1, problem.case5XorSubGridM) * std::max(1, problem.case5XorSubGridN);
+    const int maxMs = case5XorSlmSlotMs(problem);
+    const int slotsPerThread = maxMs * nFolds;
+    const int wgThreads = strategy.wg[LoopM] * strategy.wg[LoopN];
+    return static_cast<size_t>(wgThreads) * static_cast<size_t>(slotsPerThread) * sizeof(uint32_t);
+}
+
+size_t case5TileXorAccSlmBytesPerWG(const GEMMProblem &problem, const GEMMStrategy &strategy)
+{
+    if (!problem.case5TileXorAccSlm) return 0;
+    const int nFolds = std::max(1, problem.case5XorSubGridM) * std::max(1, problem.case5XorSubGridN);
+    const int nBlocks = std::max(1, problem.case5XorMaxMilestones / 16);
+    const int wgThreads = strategy.wg[LoopM] * strategy.wg[LoopN] * std::max(1, strategy.wg[LoopK]);
+    return static_cast<size_t>(wgThreads) * static_cast<size_t>(nBlocks) * static_cast<size_t>(nFolds) * 64;
+}
+
+size_t case5TileXorAccSlmByteOffset(HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy)
+{
+    GEMMProblem base = problem;
+    base.case5TileXorAccSlm = false;
+    return gemmSLMSize(hw, base, strategy, false);
+}
+
+size_t case5TileXorSlmByteOffset(HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                bool computeMax)
+{
+    GEMMProblem base = problem;
+    base.case5TileXorSlm = false;
+    return gemmSLMSize(hw, base, strategy, computeMax);
+}
 
 size_t gemmSLMSize(HW hw, const GEMMProblem &problem, const GEMMStrategy &strategy, bool computeMax)
 {
@@ -44,6 +106,9 @@ size_t gemmSLMSize(HW hw, const GEMMProblem &problem, const GEMMStrategy &strate
     // Beta/post-op fusing needs SLM to transmit a single flag.
     if ((strategy.fuseBeta && !strategy.altFusedBeta) || strategy.fusePostOps)
         slmSize = std::max<size_t>(slmSize, 8);
+
+    slmSize += case5TileXorSlmBytesPerWG(problem, strategy);
+    slmSize += case5TileXorAccSlmBytesPerWG(problem, strategy);
 
     return slmSize;
 }

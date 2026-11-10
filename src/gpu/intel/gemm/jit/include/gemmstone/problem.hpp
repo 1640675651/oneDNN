@@ -175,6 +175,20 @@ struct CommonProblem {
 };
 
 // GEMM kernel problem description.
+// Set by the generator right after gemmAllocRegs: an A/B operand register block of an XeHPG dp4a
+// (non-systolic) kernel starts on an odd GRF. SIMD16 dword operands then straddle a GRF pair, the slow
+// bank placement on XeHPG cores (A770 dp4a microbenchmark 79.6% vs 96%). case5OperandOddBase() holds
+// the first such block's start register; the host rebuilds with case5RegPadAt = that register, so the
+// block moves up by one. Reset by the host before each build.
+inline bool &case5OperandOddGrf() {
+    static bool odd = false;
+    return odd;
+}
+inline int &case5OperandOddBase() {
+    static int base = -1;
+    return base;
+}
+
 struct GEMMProblem : public CommonProblem {
     Type Ta, Tb, Tc, Ts;                            // Types for A/B/C/scalars in registers.
     Type Ta_ext, Tb_ext, Tc_ext;                    // Types for A/B/C data in memory.
@@ -209,6 +223,30 @@ struct GEMMProblem : public CommonProblem {
     MatrixAddressing sroundSeed;
     PostOpsProblem postOps;                         // Fused post operations to apply
     ngen::Product product;
+    bool case5TileXor = false;                      // Case5: emit milestoned tile XOR of C_regs
+    bool case5TileXorNop = false;                   // Case5.1: same gate/store schedule, no C fold
+    bool case5TileXorIncremental = false;           // Case5.2: spread fold XOR across panel tail; store reduces
+    bool case5TileXorTree = false;                  // Case5.3: tree-reduce SIMD XOR fold (8 partial GRFs)
+    bool case5TileXorWrap = false;                  // Case5.4: 32 K milestones, 16 output slots (ms^ms+16)
+    bool case5TileXorWrapGrf = false;               // Case5.5: wrap with 2 GRF/tile staging (no global reload)
+    bool case5TileXorBlake3 = false;                // Case5.6: b3_compress64 on 16 wrap-GRF slots per tile
+    int case5TileXorWrapGrfStoreMode = 2;           // 0=off 1=in-loop ms>=N 2=epilogue (CASE5_XOR_WRAP_GRF_FLUSH)
+    bool case5TileXorWrapGrfStageUnified = true;    // false=hybrid mov/xor (CASE5_XOR_WRAP_GRF_STAGE=hybrid)
+    bool case5TileXorSlm = false;                   // Stage milestone XOR in SLM; flush to global at epilogue
+    int case5XorFoldChunks = 8;                     // Case5.2: column/GRF chunks per milestone panel
+    int case5XorMaxMilestones = 1;                  // K / milestone_k (K-loop milestone count)
+    int case5XorOutputMilestones = 0;
+    int case5RegPadAt = -1;                         // GRF reserved during gemmAllocRegs (operand bank fix)
+    bool case5JackpotArgsInBuf = false;             // Case 5.6: key read from blake3_out's 64-byte header               // Case5.4: global tile_xor rows (0 → max/2 when wrap)
+    int case5XorPeriod = 1;                         // Store every N unrollK panels (KR=128 -> 4 when k32)
+    int case5XorSubM = 0;                           // Logical sub-tile height (<= unrollM)
+    int case5XorSubN = 0;                           // Logical sub-tile width (<= unrollN)
+    int case5XorSubGridM = 1;                       // Sub-tiles per thread along M
+    int case5XorSubGridN = 1;                       // Sub-tiles per thread along N
+    bool case5TileXorInterleaved = false;           // XMX: fold split across dpas chain boundaries (period 1)
+    bool case5TileXorFold16 = false;                // Case5.5a: per-block rotl fold to 16 words, one line per sub-tile
+    bool case5TileXorAccSlm = false;                // Case5.7: the 16-milestone line blocks go to SLM as they complete and are folded into the message after the k loop (frees the accumulator GRFs)
+    int case5XorLayout = 0;                         // tile_xor index: 0 [ms][tile], 1 [thread][ms][sub] (diag), 2 [tile][ms]
 
     // The following data is derived from the postOps and does not need
     //   to be considered for equality/hashing purposes.

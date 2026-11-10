@@ -420,6 +420,29 @@ void Generator<hw>::gemm(GEMMProblem &problem, GEMMStrategy &strategy, GEMMState
     if (strategy.kParallel && !strategy.kInterleave)
         add(1 | gt | state.flagAP, idK, idK, state.lidK);
 
+    if (problem.case5TileXor) {
+        if (problem.case5JackpotArgsInBuf) {
+            // Case 5.6: the key comes from blake3_out's header; release its registers before the Case 5
+            // prologue and the k loop allocate, so they land as in Case 5.5 (XeHPG dp4a: otherwise the A
+            // operand block can start on an odd GRF). Same scheme as CPPminer's CASE5_JACKPOT_ARGBUF.
+            for (int i = 0; i < 8; i++)
+                state.ra.safeRelease(state.inputs.blake3KeyWords[i]);
+        }
+        gemmCase5TileXorAlloc(problem, strategy, state);
+        case5UpdateTileXorSpatialIdFromIds(problem, strategy, state, idM, idN);
+        if (std::getenv("CASE5_DEBUG_RA")) {
+            auto pr = [](const char *n, const ngen::Subregister &s) {
+                if (s.isValid()) std::fprintf(stderr, "  %s=r%d.%d", n, s.getBase(), s.getOffset());
+            };
+            std::fprintf(stderr, "[ra] after tileXorAlloc: %d GRFs", state.ra.countAllocedRegisters());
+            pr("tileXor", state.inputs.tileXor); pr("tileCount", state.inputs.tileCount);
+            pr("tileCols", state.inputs.tileCols); pr("xorPeriod", state.inputs.xorPeriod);
+            pr("blake3Out", state.inputs.blake3Out); pr("k0", state.inputs.blake3KeyWords[0]);
+            pr("k7", state.inputs.blake3KeyWords[7]);
+            std::fprintf(stderr, "\n");
+        }
+    }
+
     mulConstant(1, state.i0, idM, strategy.unroll[LoopM]);
     mulConstant(1, state.j0, idN, strategy.unroll[LoopN] * strategy.cInterleaveChunk(problem.Tc_ext));
 
@@ -583,6 +606,7 @@ void Generator<hw>::gemm(GEMMProblem &problem, GEMMStrategy &strategy, GEMMState
         if (checkB) emov(1 | f1[1], state.offsetB, 0, strategy, state);
     }
 
+    gemmCase5TileXorIterationInit(problem, strategy, state);
     gemmSetupABC(problem, strategy, state);
     gemmSubkernel(problem, strategy, state);
 
@@ -1014,6 +1038,19 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
         if (!gemmFusedPostOpsFinalize(labelLateExit, problem, strategy, state)) return false;
     }
 
+    // Case5 interleaved XMX fold: finish and store the last milestone (C_regs still live).
+    if (problem.case5TileXor && problem.case5TileXorInterleaved)
+        gemmCase5TileXorFinalFlush(problem, strategy, state);
+
+    // Case5 SLM-staged tile_xor: flush before any registerOutput marshaling.
+    if (problem.case5TileXor && problem.case5TileXorSlm)
+        gemmCase5TileXorFlushFromSlm(problem, strategy, state);
+    else if (problem.case5TileXor && problem.case5TileXorBlake3) {
+        gemmCase5TileXorBlake3FromGrf(problem, strategy, state);
+    } else if (problem.case5TileXor && problem.case5TileXorWrapGrf
+             && problem.case5TileXorWrapGrfStoreMode == 2 && !problem.case5TileXorInterleaved)   // interleaved: the final flush stored the accumulators
+        gemmCase5TileXorFlushFromGrf(problem, strategy, state);
+
     if (strategy.registerOutput()) {
         // Marshal C into output registers. The main path defines the output registers.
         if (outputCRange.empty()) {
@@ -1023,6 +1060,9 @@ bool Generator<hw>::gemmBodyInternal(GEMMProblem &problem, GEMMStrategy &strateg
             // FIXME: check that layouts are compatible, and rearrange if not.
             overlappedCopy(state.C_regs[0], outputCRange, state);
         }
+    } else if (problem.case5TileXor && !problem.case5TileXorSlm) {
+        // Case5 / 5.4 wrap / 5.5 wrapGrf: tile_xor written in K-loop or GRF epilogue flush.
+        // Case5.6: only blake3_out written; wrap XOR stays in GRF until BLAKE3 epilogue.
     } else {
         // Regular C update into memory.
         if (!gemmUpdateCDispatch(problem, strategy, state)) return false;
