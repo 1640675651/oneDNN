@@ -1051,7 +1051,8 @@ std::ostream &operator<<(std::ostream &s, const attr_t::post_ops_t &post_ops) {
                     = e.is_binary_kind_with_ternary_op() ? "." : ":";
 
             if (e.binary.mask_input != attr_t::mask_input_t::none
-                    || e.binary.tag != tag::any) {
+                    || e.binary.tag != tag::any || !e.binary.strides.empty()
+                    || e.binary.grouped) {
                 if (e.binary.mask_input == attr_t::mask_input_t::mask) {
                     s << src_delim << e.binary.mask;
                 } else {
@@ -1059,16 +1060,21 @@ std::ostream &operator<<(std::ostream &s, const attr_t::post_ops_t &post_ops) {
                     s << src_delim << e.binary.policy;
                 }
             }
-            if (e.binary.tag != tag::any) s << src_delim << e.binary.tag;
-            if (!e.binary.strides.empty())
-                s << src_delim << dims2str(e.binary.strides);
-            if (e.binary.grouped) s << src_delim << "grouped";
+            if (e.binary.grouped) {
+                s << src_delim << "grouped";
+            } else {
+                if (e.binary.tag != tag::any || !e.binary.strides.empty())
+                    s << src_delim << e.binary.tag;
+                if (!e.binary.strides.empty())
+                    s << src_delim << dims2str(e.binary.strides);
+            }
 
             if (e.is_binary_kind_with_ternary_op()) {
                 bool delim_added = false;
 
                 if (e.binary.src2_mask_input != attr_t::mask_input_t::none
-                        || e.binary.src2_tag != tag::any) {
+                        || e.binary.src2_tag != tag::any
+                        || !e.binary.strides2.empty()) {
                     s << ":";
                     delim_added = true;
                     if (e.binary.src2_mask_input
@@ -1080,9 +1086,10 @@ std::ostream &operator<<(std::ostream &s, const attr_t::post_ops_t &post_ops) {
                         s << e.binary.src2_policy;
                     }
                 }
-                if (e.binary.src2_tag != tag::any) {
+                if (e.binary.src2_tag != tag::any || !e.binary.strides2.empty())
                     s << (delim_added ? src_delim : ":") << e.binary.src2_tag;
-                }
+                if (!e.binary.strides2.empty())
+                    s << src_delim << dims2str(e.binary.strides2);
             }
         } else if (e.is_prelu_kind()) {
             if (e.prelu.mask_input == attr_t::mask_input_t::mask) {
