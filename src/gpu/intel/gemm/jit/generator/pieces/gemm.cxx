@@ -453,9 +453,10 @@ void Generator<hw>::gemm(GEMMProblem &problem, GEMMStrategy &strategy, GEMMState
         case5UpdateTileXorSpatialIdFromIds(problem, strategy, state, idM, idN);
         if (problem.case5JackpotCoop)
             gemmCase5TileXorCoopStageArgs(problem, strategy, state);
-        if (problem.case5JackpotArgsInBuf) {
+        if (problem.case5JackpotArgsInBuf && problem.case5FuseJackpot) {
             // tile_cols / tile_count were needed for the spatial id above; see the release before
-            // gemmCase5TileXorAlloc for the rest.
+            // gemmCase5TileXorAlloc for the rest. Only with the in-kernel judge, which reads them from
+            // the found buffer: gemm_xor's digest path (key in blake3_out's header) still needs them.
             state.ra.safeRelease(state.inputs.tileCols);
             state.ra.safeRelease(state.inputs.tileCount);
             state.ra.safeRelease(state.inputs.xorPeriod);

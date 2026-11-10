@@ -255,6 +255,8 @@ protected:
                                       GEMMState &state);
     void gemmCase5TileXorBlake3FromGrf(const GEMMProblem &problem, const GEMMStrategy &strategy,
                                        GEMMState &state);
+    void gemmCase5TileXorBlake3Digest(const GEMMProblem &problem, const GEMMStrategy &strategy,
+                                      GEMMState &state);
     void gemmCase5ReleaseAccForBlake3(const GEMMStrategy &strategy, GEMMState &state);
     void case5TileXorLoadAccFromSlm(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);
     void gemmCase5TileXorJackpotCoop(const GEMMProblem &problem, const GEMMStrategy &strategy, GEMMState &state);

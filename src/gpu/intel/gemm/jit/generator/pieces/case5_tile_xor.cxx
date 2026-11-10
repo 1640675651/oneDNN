@@ -1108,9 +1108,9 @@ void Generator<hw>::gemmCase5TileXorStore(const GEMMProblem &problem, const GEMM
             add(1, a0[0], a0[0], byteOff);
 
             auto xorContributionIntoWrap = [&]() {
-                if (problem.case5FuseJackpot || problem.case5TileXorBlake3
-                        || problem.case5TileXorWrapGrf) {
+                if (problem.case5WrapFoldRotl) {
                     // fold_milestones semantics (cp_jackpot / cp_onednn_jackpot): rotl slot then xor x.
+                    // CPPminer sets the flag; gemm_xor's Case 5.4-5.6 references fold with plain xor.
                     auto slotVal = state.ra.alloc_sub<uint32_t>();
                     mov(1, slotVal, indirect[a0].ud(0));
                     auto rotHi = state.ra.alloc_sub<uint32_t>();

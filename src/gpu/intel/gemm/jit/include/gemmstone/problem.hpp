@@ -222,9 +222,10 @@ struct GEMMProblem : public CommonProblem {
     bool case5TileXorWrapGrfStageUnified = true;    // false=hybrid mov/xor (CASE5_XOR_WRAP_GRF_STAGE=hybrid)
     bool case5TileXorSlm = false;                   // Stage milestone XOR in SLM; flush to global at epilogue
     bool case5TileXorBlake3 = false;                // Case5.6: b3_compress64 on 16 wrap-GRF slots per tile
-    bool case5FuseJackpot = false;                  // wrap-GRF fold uses rotl(slot,13)^x (cp_jackpot)
+    bool case5FuseJackpot = false;                  // in-kernel jackpot judge (CPPminer)
+    bool case5WrapFoldRotl = false;                 // wrap-GRF fold: slot = rotl(slot, 13) ^ x (CPPminer's message) instead of slot ^= x (gemm_xor Case 5.4-5.6)
     bool case5JackpotCoop = false;                  // fused jackpot on the fold16 message: SIMD16 BLAKE3 + judge by 1/4 of the threads via SLM
-    bool case5JackpotArgsInBuf = false;             // wrap-GRF fused jackpot: arguments read from the found buffer
+    bool case5JackpotArgsInBuf = false;             // wrap-GRF BLAKE3: with case5FuseJackpot (CPPminer) key, bound, tile_cols, tr/tc bases and tile_count are read from the found buffer; without it (gemm_xor Case 5.6) only the key, from blake3_out's 64-byte header, digests after it
     bool case5JackpotCoopSlm = false;               // coop: SLM transpose + SIMD8 hashing threads (CASE5_COOP_OWN=0) instead of own-tile SIMD-N
     bool case5JackpotCoopAudit = false;             // coop: also write every tile's digest and message to the found buffer (host audit)
     int case5XorFoldChunks = 8;                     // Case5.2: column/GRF chunks per milestone panel
